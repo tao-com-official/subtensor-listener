@@ -9,6 +9,7 @@ import {
 import type { WebhookNotifier } from '../notifications/webhook.notifier';
 import {
   BlockScanner,
+  BlockUnavailableError,
   type MatchedEvent,
 } from '../subtensor/block-scanner.service';
 import type { ChainConnectionService } from '../subtensor/chain-connection.service';
@@ -167,10 +168,13 @@ export class ChainEventListener {
     const api = await this.connection.getConnection(this.def.endpoints);
     if (this.stopped) return;
 
+    // Same api instance = a plain socket reconnect. The node behind it may
+    // still have changed (the provider re-resolves the endpoint), so retarget
+    // rather than bump — the new node can be behind the old one's head.
     if (api === this.api) {
       const head = await this.scanner.bestNumber(api);
       if (this.stopped) return;
-      this.bump(head);
+      this.retarget(head);
       return;
     }
 
@@ -188,7 +192,7 @@ export class ChainEventListener {
       this.lastProcessed,
       Math.max(-1, head - this.backfillBlocks),
     );
-    this.bump(head);
+    this.retarget(head);
   }
 
   private scheduleReattachRetry(): void {
@@ -239,9 +243,26 @@ export class ChainEventListener {
     };
   }
 
+  /** Raises the drain target to `head` if it's ahead of what we already know. */
   private bump(head: number): void {
     if (this.stopped) return;
     if (head > this.targetHead) this.targetHead = head;
+    void this.drain();
+  }
+
+  /**
+   * Re-points the drain target at `head`, **lowering** it if necessary. Unlike
+   * {@link bump}, this drops the previous high-water mark, because that mark
+   * describes the node we *were* talking to. A reconnect re-resolves DNS, and a
+   * load-balanced endpoint can hand us a different node in the pool whose head
+   * is behind the previous one's. Keeping the old target would make us demand
+   * blocks this node simply doesn't have yet — every one of them answered with
+   * the zero hash. The blocks aren't lost: this node's own head subscription
+   * walks up to them as it catches up.
+   */
+  private retarget(head: number): void {
+    if (this.stopped) return;
+    this.targetHead = head;
     void this.drain();
   }
 
@@ -260,8 +281,21 @@ export class ChainEventListener {
           from = minFrom;
         }
         from = Math.max(from, 0);
-        await this.processRange(from, to);
-        this.lastProcessed = to;
+        const lastOk = await this.processRange(from, to);
+        if (lastOk >= from) this.lastProcessed = lastOk;
+        if (lastOk < to) {
+          // Something in from..to didn't process — most often because this node
+          // is behind and doesn't have those blocks yet. Leave lastProcessed
+          // short of them so the next head retries them, and stop draining
+          // until then: looping here would just hammer a node that has nothing
+          // new to give us. Never advance past a block we failed to read — that
+          // is how an upgrade alert gets dropped for good.
+          this.logger.warn(
+            `Blocks ${lastOk + 1}..${to} not processed (node behind or scan failed); ` +
+              `retrying on the next head.`,
+          );
+          return;
+        }
       }
     } catch (err) {
       this.logger.error(`Drain error: ${(err as Error).message}`);
@@ -270,16 +304,34 @@ export class ChainEventListener {
     }
   }
 
-  private async processRange(from: number, to: number): Promise<void> {
+  /**
+   * Scans `from..to`, returning the last block processed in an unbroken run
+   * starting at `from`. Stops at the first block that failed: on a lagging node
+   * every later block is missing too, and skipping over a failure would drop
+   * the block permanently.
+   */
+  private async processRange(from: number, to: number): Promise<number> {
+    let lastOk = from - 1;
     for (let start = from; start <= to; start += SCAN_CONCURRENCY) {
       const end = Math.min(start + SCAN_CONCURRENCY - 1, to);
       const numbers: number[] = [];
       for (let n = start; n <= end; n++) numbers.push(n);
-      await Promise.all(numbers.map((n) => this.processBlock(n)));
+      const results = await Promise.all(
+        numbers.map((n) => this.processBlock(n)),
+      );
+      const failed = results.indexOf(false);
+      if (failed !== -1) return numbers[failed] - 1;
+      lastOk = end;
     }
+    return lastOk;
   }
 
-  private async processBlock(blockNumber: number): Promise<void> {
+  /**
+   * Scans one block and delivers any matches. Returns false if the block still
+   * needs processing — either the node doesn't have it yet or the scan failed —
+   * in which case the caller must not advance past it.
+   */
+  private async processBlock(blockNumber: number): Promise<boolean> {
     try {
       const matches = await this.scanner.scanBlock(
         this.api,
@@ -294,10 +346,16 @@ export class ChainEventListener {
         );
         await this.handleMatch(match, { send: true });
       }
+      return true;
     } catch (err) {
-      this.logger.error(
-        `Failed to process block ${blockNumber}: ${(err as Error).message}`,
-      );
+      // A block the node doesn't have yet is expected on a lagging node, not an
+      // error: the drain loop reports the gap once and retries.
+      if (!(err instanceof BlockUnavailableError)) {
+        this.logger.error(
+          `Failed to process block ${blockNumber}: ${(err as Error).message}`,
+        );
+      }
+      return false;
     }
   }
 

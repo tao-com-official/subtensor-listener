@@ -24,6 +24,26 @@ interface BlockApi {
   };
 }
 
+/** The all-zero hash `chain_getBlockHash` answers with for an unknown block. */
+const EMPTY_HASH = `0x${'00'.repeat(32)}`;
+
+/**
+ * Thrown when the connected node does not (yet) have a block. Kept distinct
+ * from a genuine scan failure so callers can retry instead of skipping.
+ *
+ * `chain_getBlockHash` does not error for a block above the node's head — it
+ * answers with the zero hash. That happens whenever the socket is pinned to a
+ * node that lags the one we previously read the head from, which a
+ * load-balanced endpoint makes routine: every reconnect re-resolves DNS and may
+ * land on a different, further-behind node in the pool.
+ */
+export class BlockUnavailableError extends Error {
+  constructor(readonly blockNumber: number) {
+    super(`Block ${blockNumber} is not available on the connected node`);
+    this.name = 'BlockUnavailableError';
+  }
+}
+
 /** A chain event that matched a listener's filter, with block context. */
 export interface MatchedEvent {
   pallet: string;
@@ -55,6 +75,8 @@ export class BlockScanner {
   /**
    * Scans a single block for events matching any of `filters`. Returns one
    * {@link MatchedEvent} per matching event record.
+   *
+   * @throws {BlockUnavailableError} if the node doesn't have the block yet.
    */
   async scanBlock(
     api: ApiPromise,
@@ -64,6 +86,9 @@ export class BlockScanner {
     const blockHash = (
       await api.rpc.chain.getBlockHash(blockNumber)
     ).toString();
+    // Catch the zero hash here rather than letting api.at() choke on it with an
+    // opaque "Unable to retrieve header and parent from supplied hash".
+    if (isEmptyHash(blockHash)) throw new BlockUnavailableError(blockNumber);
     const apiAt = (await api.at(blockHash)) as unknown as BlockApi;
     const records = await apiAt.query.system.events();
 
@@ -139,6 +164,13 @@ export class BlockScanner {
     }
     return { from, to };
   }
+}
+
+/** True for the zero hash (and its short `0x0` spellings) — i.e. "no such block". */
+export function isEmptyHash(hash: string): boolean {
+  const trimmed = hash.trim().toLowerCase();
+  if (trimmed === EMPTY_HASH) return true;
+  return /^0x0*$/.test(trimmed);
 }
 
 /** Case-sensitive match of an event's pallet+method against the filters. */
