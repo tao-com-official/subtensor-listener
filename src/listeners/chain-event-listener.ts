@@ -38,6 +38,13 @@ export interface ReplayResult {
 /** How many blocks to scan concurrently while backfilling a range. */
 const SCAN_CONCURRENCY = 5;
 
+/** Result of scanning one block. */
+type BlockOutcome = 'ok' | 'failed' | 'unavailable';
+const BLOCK_OK: BlockOutcome = 'ok';
+const BLOCK_FAILED: BlockOutcome = 'failed';
+/** The node doesn't have the block yet — expected while it catches up. */
+const BLOCK_UNAVAILABLE: BlockOutcome = 'unavailable';
+
 /** Backoff before retrying a reattach that failed transiently. */
 const REATTACH_RETRY_MS = 2500;
 
@@ -61,6 +68,23 @@ export class ChainEventListener {
   private draining = false;
   private stopped = false;
 
+  /**
+   * Blocks that failed to scan and still owe us a look. Kept **separate from
+   * the cursor**: `lastProcessed` always advances, so one unreadable block can
+   * never stall alerting for the blocks behind it, while the block itself is
+   * still retried on every head until it reads or falls out of the window.
+   */
+  private readonly pending = new Set<number>();
+
+  /**
+   * Bumped whenever {@link reattachOnce} rewinds the cursor. A drain pass that
+   * started before the rewind must not write its stale `lastProcessed` back
+   * over it — the rewind is what re-reads the upgrade-boundary block on the
+   * fresh connection, and the upgrade block is typically the very block being
+   * scanned when the recreate fires.
+   */
+  private generation = 0;
+
   /** Serializes reattach() so racing reconnect signals can't leak head subs. */
   private reattaching = false;
   private reattachQueued = false;
@@ -82,9 +106,12 @@ export class ChainEventListener {
 
   async start(): Promise<void> {
     this.api = await this.connection.getConnection(this.def.endpoints);
+    if (this.stopped) return;
     await this.api.isReady;
+    if (this.stopped) return;
 
     const best = await this.scanner.bestNumber(this.api);
+    if (this.stopped) return;
     // Seed lastProcessed so the first drain covers exactly the backfill window.
     this.lastProcessed = Math.max(-1, best - this.backfillBlocks);
     this.logger.log(
@@ -93,6 +120,15 @@ export class ChainEventListener {
     this.bump(best);
 
     await this.subscribeHeads();
+
+    // stop() may have run while start() was awaiting a slow RPC — it would have
+    // found unsubscribe/detachReconnect still unset and torn down nothing. Undo
+    // the subscription ourselves rather than leaking a live head feed.
+    if (this.stopped) {
+      this.unsubscribe?.();
+      this.unsubscribe = undefined;
+      return;
+    }
 
     // On reconnect *or* connection recreation (after a runtime upgrade), the
     // pooled api may be a brand-new instance — re-acquire it, re-subscribe, and
@@ -103,6 +139,10 @@ export class ChainEventListener {
       this.def.endpoints,
       () => void this.reattach(),
     );
+    if (this.stopped) {
+      this.detachReconnect();
+      this.detachReconnect = undefined;
+    }
   }
 
   /**
@@ -171,6 +211,16 @@ export class ChainEventListener {
     // Same api instance = a plain socket reconnect. The node behind it may
     // still have changed (the provider re-resolves the endpoint), so retarget
     // rather than bump — the new node can be behind the old one's head.
+    //
+    // With the current drain this is belt-and-braces rather than load-bearing:
+    // the cursor always catches up to targetHead, so on a backwards node swap
+    // lastProcessed already sits above the new head and the drain simply idles
+    // until the node passes it. It is kept because the invariant it states —
+    // targetHead is "how far the *current* socket reaches", not a high-water
+    // mark across nodes — is what makes a lagging node safe, and a future drain
+    // that can leave the cursor behind would depend on it. Deliberately not
+    // pinned by a test: with this drain, bump and retarget are indistinguishable
+    // here.
     if (api === this.api) {
       const head = await this.scanner.bestNumber(api);
       if (this.stopped) return;
@@ -187,7 +237,10 @@ export class ChainEventListener {
       this.unsubscribe?.();
       return;
     }
-    // Rewind to re-cover the recent window (incl. the upgrade boundary).
+    // Rewind to re-cover the recent window (incl. the upgrade boundary), and
+    // mark the state as moved on so a drain pass already in flight can't write
+    // its stale cursor back over the rewind.
+    this.generation++;
     this.lastProcessed = Math.min(
       this.lastProcessed,
       Math.max(-1, head - this.backfillBlocks),
@@ -266,6 +319,14 @@ export class ChainEventListener {
     void this.drain();
   }
 
+  /**
+   * Scans everything between the cursor and the target head, plus any blocks
+   * still owed a retry. The cursor **always** advances to the target: a block
+   * we couldn't read is parked in {@link pending} rather than holding the
+   * cursor back, so one unreadable block never stops alerting for the blocks
+   * behind it. Pending blocks are retried on each pass and only given up on
+   * once they fall out of the backfill window.
+   */
   private async drain(): Promise<void> {
     if (this.draining) return;
     this.draining = true;
@@ -281,21 +342,26 @@ export class ChainEventListener {
           from = minFrom;
         }
         from = Math.max(from, 0);
-        const lastOk = await this.processRange(from, to);
-        if (lastOk >= from) this.lastProcessed = lastOk;
-        if (lastOk < to) {
-          // Something in from..to didn't process — most often because this node
-          // is behind and doesn't have those blocks yet. Leave lastProcessed
-          // short of them so the next head retries them, and stop draining
-          // until then: looping here would just hammer a node that has nothing
-          // new to give us. Never advance past a block we failed to read — that
-          // is how an upgrade alert gets dropped for good.
-          this.logger.warn(
-            `Blocks ${lastOk + 1}..${to} not processed (node behind or scan failed); ` +
-              `retrying on the next head.`,
-          );
-          return;
-        }
+
+        // Retries first: a pending block is older than `from`, and on a lagging
+        // node it is the one most likely to have become readable.
+        const numbers = [...this.pending]
+          .filter((n) => n < from)
+          .sort((a, b) => a - b);
+        for (let n = from; n <= to; n++) numbers.push(n);
+
+        const gen = this.generation;
+        await this.processBlocks(numbers);
+
+        // A reattach rewound the cursor while we were scanning (the upgrade
+        // block is usually the very block in flight when the recreate fires).
+        // That rewind is deliberate — re-read the boundary on the fresh
+        // connection — so leave it alone and start over from the new state.
+        if (gen !== this.generation) continue;
+        if (this.stopped) return;
+
+        this.lastProcessed = Math.max(this.lastProcessed, to);
+        this.expirePending(to);
       }
     } catch (err) {
       this.logger.error(`Drain error: ${(err as Error).message}`);
@@ -305,33 +371,51 @@ export class ChainEventListener {
   }
 
   /**
-   * Scans `from..to`, returning the last block processed in an unbroken run
-   * starting at `from`. Stops at the first block that failed: on a lagging node
-   * every later block is missing too, and skipping over a failure would drop
-   * the block permanently.
+   * Scans `numbers` in batches of {@link SCAN_CONCURRENCY}. Blocks that fail
+   * join {@link pending}; blocks that succeed leave it.
    */
-  private async processRange(from: number, to: number): Promise<number> {
-    let lastOk = from - 1;
-    for (let start = from; start <= to; start += SCAN_CONCURRENCY) {
-      const end = Math.min(start + SCAN_CONCURRENCY - 1, to);
-      const numbers: number[] = [];
-      for (let n = start; n <= end; n++) numbers.push(n);
-      const results = await Promise.all(
-        numbers.map((n) => this.processBlock(n)),
-      );
-      const failed = results.indexOf(false);
-      if (failed !== -1) return numbers[failed] - 1;
-      lastOk = end;
+  private async processBlocks(numbers: number[]): Promise<void> {
+    for (let i = 0; i < numbers.length; i += SCAN_CONCURRENCY) {
+      if (this.stopped) return;
+      const batch = numbers.slice(i, i + SCAN_CONCURRENCY);
+      const results = await Promise.all(batch.map((n) => this.processBlock(n)));
+      batch.forEach((n, idx) => {
+        if (results[idx] === BLOCK_OK) this.pending.delete(n);
+        else this.pending.add(n);
+      });
+      // Every block above a node's head is unavailable too, so once one comes
+      // back unavailable there is nothing to gain from the rest of this pass.
+      if (results.includes(BLOCK_UNAVAILABLE)) {
+        for (const n of batch.slice(results.indexOf(BLOCK_UNAVAILABLE))) {
+          this.pending.add(n);
+        }
+        return;
+      }
     }
-    return lastOk;
   }
 
   /**
-   * Scans one block and delivers any matches. Returns false if the block still
-   * needs processing — either the node doesn't have it yet or the scan failed —
-   * in which case the caller must not advance past it.
+   * Drops pending blocks that have fallen outside the backfill window. This is
+   * the one place a block is abandoned for good, so it is logged loudly — the
+   * alternative is retrying it forever.
    */
-  private async processBlock(blockNumber: number): Promise<boolean> {
+  private expirePending(head: number): void {
+    const oldest = head - this.backfillBlocks + 1;
+    for (const n of this.pending) {
+      if (n >= oldest) continue;
+      this.pending.delete(n);
+      this.logger.error(
+        `Gave up on block ${n}: still unreadable after ${this.backfillBlocks} blocks. ` +
+          `Any ${this.eventLabel} in it was NOT alerted.`,
+      );
+    }
+  }
+
+  /**
+   * Scans one block and delivers any matches. Reports whether the block is
+   * done, still owed a retry, or simply not on this node yet.
+   */
+  private async processBlock(blockNumber: number): Promise<BlockOutcome> {
     try {
       const matches = await this.scanner.scanBlock(
         this.api,
@@ -339,6 +423,7 @@ export class ChainEventListener {
         this.def.events,
       );
       for (const match of matches) {
+        if (this.stopped) return BLOCK_FAILED;
         const key = dedupKey(this.def.network, match);
         if (!this.dedup.shouldAlert(key, blockNumber)) continue;
         this.logger.log(
@@ -346,16 +431,16 @@ export class ChainEventListener {
         );
         await this.handleMatch(match, { send: true });
       }
-      return true;
+      return BLOCK_OK;
     } catch (err) {
-      // A block the node doesn't have yet is expected on a lagging node, not an
-      // error: the drain loop reports the gap once and retries.
-      if (!(err instanceof BlockUnavailableError)) {
-        this.logger.error(
-          `Failed to process block ${blockNumber}: ${(err as Error).message}`,
-        );
-      }
-      return false;
+      // A block the node doesn't have yet is routine on a lagging node, not an
+      // error — it's retried, not logged at error level.
+      if (err instanceof BlockUnavailableError) return BLOCK_UNAVAILABLE;
+      if (this.stopped) return BLOCK_FAILED;
+      this.logger.error(
+        `Failed to process block ${blockNumber}: ${(err as Error).message}`,
+      );
+      return BLOCK_FAILED;
     }
   }
 

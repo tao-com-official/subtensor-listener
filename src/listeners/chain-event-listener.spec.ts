@@ -95,6 +95,17 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     blockHash: `0x${blockNumber.toString(16)}`,
   });
 
+  /**
+   * A CodeUpdated whose *arguments* differ per block, so the dedup key differs
+   * too. Needed whenever a test expects an alert from several nearby blocks —
+   * with identical args the 5-block dedup window would (correctly) merge them,
+   * and the test would pass for the wrong reason.
+   */
+  const distinctEvent = (blockNumber: number): MatchedEvent => ({
+    ...codeUpdated(blockNumber),
+    data: `["0x${blockNumber.toString(16)}"]`,
+  });
+
   /** A fake node: `available` is the highest block it actually has. */
   class FakeScanner {
     head = 0;
@@ -103,13 +114,23 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     readonly scanned: number[] = [];
     /** Blocks that throw a transient error on their next scan only. */
     readonly failOnce = new Set<number>();
+    /** Blocks that never scan successfully (e.g. an undecodable block). */
+    readonly failAlways = new Set<number>();
+    /** Hook fired as a scan starts — lets a test interleave a reconnect/stop. */
+    onScan?: (n: number) => void;
 
     bestNumber = (): Promise<number> => Promise.resolve(this.head);
 
     scanBlock = (_api: unknown, n: number): Promise<MatchedEvent[]> => {
       this.scanned.push(n);
+      this.onScan?.(n);
       if (n > this.available)
         return Promise.reject(new BlockUnavailableError(n));
+      if (this.failAlways.has(n)) {
+        return Promise.reject(
+          new Error('Unable to decode storage system.events'),
+        );
+      }
       if (this.failOnce.has(n)) {
         this.failOnce.delete(n);
         return Promise.reject(new Error('disconnected: 1000:: Normal Closure'));
@@ -276,9 +297,105 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     await flush();
     expect(sent).toHaveLength(1);
 
-    // A reconnect rewinds over the same window; dedup must suppress the repeat.
+    // recreateApi() is what makes this a *rewind*: without it reattachOnce
+    // takes the same-api branch, nothing is re-scanned, and dedup is never
+    // exercised at all.
+    scanner.scanned.length = 0;
+    conn.recreateApi();
     conn.fireReconnect();
     await flush();
-    expect(sent).toHaveLength(1);
+
+    expect(scanner.scanned).toContain(UPGRADE_BLOCK); // the rewind really re-scanned it
+    expect(sent).toHaveLength(1); // ...and dedup suppressed the repeat
+  });
+
+  it('keeps alerting on later blocks while one block stays unreadable', async () => {
+    // The block that never reads — e.g. the documented "Unable to decode
+    // storage system.events" after a metadata downgrade.
+    const STUCK = UPGRADE_BLOCK;
+    scanner.head = STUCK;
+    scanner.available = STUCK;
+    scanner.failAlways.add(STUCK);
+    await listener.start();
+    await flush();
+
+    // Later blocks each carry a distinct alertable event.
+    for (let n = STUCK + 1; n <= STUCK + 6; n++) {
+      scanner.matches.set(n, [distinctEvent(n)]);
+      scanner.head = n;
+      scanner.available = n;
+      conn.emitHead(n);
+      await flush();
+    }
+
+    // Pre-rework this was a ~10-minute blackout: the cursor stalled at STUCK-1
+    // and nothing after it was ever scanned.
+    expect(sent).toHaveLength(6);
+    // ...and the stuck block is still being retried, not forgotten.
+    expect(scanner.scanned.filter((n) => n === STUCK).length).toBeGreaterThan(
+      1,
+    );
+  });
+
+  it('re-reads the upgrade block when the recreate fires mid-scan', async () => {
+    // The production timing: the upgrade IS the block being scanned when
+    // ChainConnectionService recreates the connection under us.
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+    scanner.onScan = (n) => {
+      if (n !== UPGRADE_BLOCK) return;
+      scanner.onScan = undefined; // once
+      conn.recreateApi();
+      conn.fireReconnect();
+    };
+
+    await listener.start();
+    await flush();
+
+    // The rewind must survive the in-flight drain writing its stale cursor back.
+    const rescans = scanner.scanned.filter((n) => n === UPGRADE_BLOCK).length;
+    expect(rescans).toBeGreaterThan(1);
+    expect(sent).toHaveLength(1); // delivered once, dedup covers the re-read
+  });
+
+  it('does not scan past a lagging node head on a plain socket reconnect', async () => {
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    await listener.start();
+    await flush();
+
+    // Same ApiPromise instance (no recreate) — but the provider re-resolved DNS
+    // and the socket is now pinned to a node 25 blocks behind.
+    const lagging = UPGRADE_BLOCK - 25;
+    scanner.scanned.length = 0;
+    scanner.head = lagging;
+    scanner.available = lagging;
+    conn.fireReconnect();
+    await flush();
+
+    expect(scanner.scanned.filter((n) => n > lagging)).toEqual([]);
+  });
+
+  it('stops delivering once stopped, even mid-drain', async () => {
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    for (let n = UPGRADE_BLOCK - 40; n <= UPGRADE_BLOCK; n++) {
+      scanner.matches.set(n, [distinctEvent(n)]);
+    }
+    // Stop as soon as the drain touches its first block.
+    scanner.onScan = () => {
+      scanner.onScan = undefined;
+      listener.stop();
+    };
+
+    await listener.start();
+    await flush();
+
+    // A 41-block backfill would otherwise deliver dozens of webhooks.
+    expect(sent.length).toBeLessThanOrEqual(1);
+    // ...and the drain must abandon the remaining batches rather than scan all
+    // 41 blocks against a connection that is being torn down under it.
+    expect(scanner.scanned.length).toBeLessThanOrEqual(5);
   });
 });

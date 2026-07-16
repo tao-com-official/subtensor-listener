@@ -24,9 +24,6 @@ interface BlockApi {
   };
 }
 
-/** The all-zero hash `chain_getBlockHash` answers with for an unknown block. */
-const EMPTY_HASH = `0x${'00'.repeat(32)}`;
-
 /**
  * Thrown when the connected node does not (yet) have a block. Kept distinct
  * from a genuine scan failure so callers can retry instead of skipping.
@@ -83,12 +80,12 @@ export class BlockScanner {
     blockNumber: number,
     filters: EventFilter[],
   ): Promise<MatchedEvent[]> {
-    const blockHash = (
-      await api.rpc.chain.getBlockHash(blockNumber)
-    ).toString();
-    // Catch the zero hash here rather than letting api.at() choke on it with an
-    // opaque "Unable to retrieve header and parent from supplied hash".
-    if (isEmptyHash(blockHash)) throw new BlockUnavailableError(blockNumber);
+    const hash = await api.rpc.chain.getBlockHash(blockNumber);
+    // `isEmpty` on the codec means all-zero bytes — i.e. the node has no such
+    // block. Catch it here rather than letting api.at() choke on the zero hash
+    // with an opaque "Unable to retrieve header and parent from supplied hash".
+    if (hash.isEmpty) throw new BlockUnavailableError(blockNumber);
+    const blockHash = hash.toString();
     const apiAt = (await api.at(blockHash)) as unknown as BlockApi;
     const records = await apiAt.query.system.events();
 
@@ -164,13 +161,6 @@ export class BlockScanner {
     }
     return { from, to };
   }
-}
-
-/** True for the zero hash (and its short `0x0` spellings) — i.e. "no such block". */
-export function isEmptyHash(hash: string): boolean {
-  const trimmed = hash.trim().toLowerCase();
-  if (trimmed === EMPTY_HASH) return true;
-  return /^0x0*$/.test(trimmed);
 }
 
 /** Case-sensitive match of an event's pallet+method against the filters. */
