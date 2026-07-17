@@ -120,30 +120,37 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     readonly failAlways = new Set<number>();
     /** Blocks reported as "not on this node" on their next scan only. */
     readonly unavailableOnce = new Set<number>();
+    /** Blocks this node never has (e.g. pruned on a warp-synced node). */
+    readonly unavailableAlways = new Set<number>();
     /** Hook fired as a scan starts — lets a test interleave a reconnect/stop. */
     onScan?: (n: number) => void;
+    /** Overrides the matches for a block based on which api scanned it. */
+    matchesByApi?: (api: unknown, n: number) => MatchedEvent[] | undefined;
+    /** Holds one block's scan (on one api) open until the test releases it. */
+    gate?: { block: number; api: unknown; promise: Promise<void> };
 
     bestNumber = (): Promise<number> => Promise.resolve(this.head);
 
-    scanBlock = (_api: unknown, n: number): Promise<MatchedEvent[]> => {
+    scanBlock = async (api: unknown, n: number): Promise<MatchedEvent[]> => {
       this.scanned.push(n);
       this.onScan?.(n);
-      if (n > this.available)
-        return Promise.reject(new BlockUnavailableError(n));
+      if (this.gate && this.gate.block === n && this.gate.api === api) {
+        await this.gate.promise;
+      }
+      if (this.unavailableAlways.has(n)) throw new BlockUnavailableError(n);
+      if (n > this.available) throw new BlockUnavailableError(n);
       if (this.unavailableOnce.has(n)) {
         this.unavailableOnce.delete(n);
-        return Promise.reject(new BlockUnavailableError(n));
+        throw new BlockUnavailableError(n);
       }
       if (this.failAlways.has(n)) {
-        return Promise.reject(
-          new Error('Unable to decode storage system.events'),
-        );
+        throw new Error('Unable to decode storage system.events');
       }
       if (this.failOnce.has(n)) {
         this.failOnce.delete(n);
-        return Promise.reject(new Error('disconnected: 1000:: Normal Closure'));
+        throw new Error('disconnected: 1000:: Normal Closure');
       }
-      return Promise.resolve(this.matches.get(n) ?? []);
+      return this.matchesByApi?.(api, n) ?? this.matches.get(n) ?? [];
     };
   }
 
@@ -206,6 +213,7 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
   /** When true the webhook rejects every POST (returns false, as it really does). */
   let webhookDown: boolean;
   let errors: string[];
+  let warns: string[];
   let listener: ChainEventListener;
 
   /** Let the drain loop's promise chain settle. */
@@ -227,6 +235,7 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     sent = [];
     attempted = [];
     errors = [];
+    warns = [];
     webhookDown = false;
     const notifier = {
       send: (_t: unknown, msg: string) => {
@@ -245,7 +254,9 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
       notifier,
       BACKFILL,
     );
-    jest.spyOn(listener['logger'], 'warn').mockImplementation(() => undefined);
+    jest
+      .spyOn(listener['logger'], 'warn')
+      .mockImplementation((m: unknown) => void warns.push(String(m)));
     jest
       .spyOn(listener['logger'], 'error')
       .mockImplementation((m: unknown) => void errors.push(String(m)));
@@ -475,5 +486,145 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     await flush();
 
     expect(sent).toHaveLength(1);
+  });
+
+  it('revives the head feed on a plain (same-api) reconnect after a failed startup subscribe', async () => {
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    conn.failSubscribe = true;
+    await expect(listener.start()).rejects.toThrow();
+    await flush();
+
+    // A plain socket reconnect — SAME api, no recreate. This is the common case;
+    // it must re-subscribe, otherwise the head feed never comes back.
+    conn.failSubscribe = false;
+    conn.fireReconnect();
+    await flush();
+
+    // The proof the feed is live: a NEW head now flows through on its own. If the
+    // same-api branch had not re-subscribed, emitHead would reach no callback.
+    scanner.matches.set(UPGRADE_BLOCK + 1, [codeUpdated(UPGRADE_BLOCK + 1)]);
+    await headTo(UPGRADE_BLOCK + 1);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain(`#${UPGRADE_BLOCK + 1}`);
+  });
+
+  it('does not leak or re-scan aged blocks when the head dips onto a lagging node', async () => {
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    await listener.start();
+    await flush();
+    const doneSet = listener['done'];
+    expect(doneSet.size).toBe(BACKFILL); // anti-vacuity: the window is populated
+    const scannedBefore = scanner.scanned.length;
+
+    // Reconnect pins a node 16 blocks behind that still HAS its old blocks.
+    scanner.head = UPGRADE_BLOCK - 16;
+    scanner.available = UPGRADE_BLOCK - 16;
+    conn.fireReconnect();
+    await flush();
+
+    // Nothing below the floor is re-scanned, and `done` never exceeds the window.
+    expect(scanner.scanned.length).toBe(scannedBefore);
+    expect(doneSet.size).toBeLessThanOrEqual(BACKFILL);
+
+    // Repeated dips must not accumulate — the classic leak.
+    for (let i = 0; i < 5; i++) {
+      scanner.head = UPGRADE_BLOCK - 16;
+      scanner.available = UPGRADE_BLOCK - 16;
+      conn.fireReconnect();
+      await flush();
+    }
+    expect(doneSet.size).toBeLessThanOrEqual(BACKFILL);
+  });
+
+  it('logs a bounded summary, not per-block, when the head jumps far forward', async () => {
+    // Stuck on a stale node, then the LB moves us onto a healthy one millions
+    // of blocks ahead.
+    scanner.head = 1000;
+    scanner.available = 1000;
+    await listener.start();
+    await flush();
+
+    scanner.head = 1000 + 5_000_000;
+    scanner.available = scanner.head;
+    conn.fireReconnect();
+    await flush();
+
+    // Must NOT emit millions of error lines / block the loop.
+    expect(errors.length).toBeLessThan(5);
+    // A single summary of the skipped span is fine.
+    expect(warns.some((w) => w.includes('Skipping blocks'))).toBe(true);
+  });
+
+  it('keeps alerting on recent blocks a warp-synced node has, despite an unavailable old block', async () => {
+    // The node has the head and recent blocks but lacks an OLD one (pruned).
+    const OLD = UPGRADE_BLOCK - 40;
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    scanner.unavailableAlways.add(OLD); // oldest-first, so this is in the first batch
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+
+    await listener.start();
+    await flush();
+
+    // The recent block's alert must go out even though an older batch member
+    // was unavailable — no full-window blackout.
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('CodeUpdated');
+  });
+
+  it('does not fire two webhooks for the same event in one concurrent batch', async () => {
+    // Two adjacent blocks in the last batch carry the SAME event (identical
+    // dedup key). Scanned concurrently, they must collapse to one alert.
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+    scanner.matches.set(UPGRADE_BLOCK - 1, [codeUpdated(UPGRADE_BLOCK - 1)]);
+
+    await listener.start();
+    await flush();
+
+    expect(attempted.length).toBeGreaterThan(0); // anti-vacuity: it did try to send
+    expect(sent).toHaveLength(1);
+  });
+
+  it('delivers the clean re-scan, not the stale decode, when a recreate lands mid-scan', async () => {
+    // The upgrade block is scanned on the doomed (downgraded) connection when
+    // the recreate fires; that decode must never reach the webhook.
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    const staleApi = conn.api;
+    let release!: () => void;
+    scanner.gate = {
+      block: UPGRADE_BLOCK,
+      api: staleApi,
+      promise: new Promise<void>((r) => (release = r)),
+    };
+    // The downgraded connection mis-decodes the spec versions (nulls → "unknown");
+    // the clean one reads the real 424 → 432. The message renders this, so it
+    // tells us WHICH decode reached the webhook.
+    scanner.matchesByApi = (api, n) => {
+      if (n !== UPGRADE_BLOCK) return undefined;
+      return api === staleApi
+        ? [{ ...codeUpdated(n), specVersionFrom: null, specVersionTo: null }]
+        : [{ ...codeUpdated(n), specVersionFrom: 424, specVersionTo: 432 }];
+    };
+
+    const startP = listener.start();
+    await flush(); // the stale scan is now gated open on the old api
+
+    // Recreate under it (upgrade path): new clean connection.
+    conn.recreateApi();
+    conn.fireReconnect();
+    await flush();
+
+    release(); // let the stale decode finally resolve
+    await startP;
+    await flush();
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('424 → 432'); // the clean decode
+    expect(sent[0]).not.toContain('unknown'); // never the downgraded one
   });
 });

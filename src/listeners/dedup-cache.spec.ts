@@ -41,6 +41,22 @@ describe('DedupCache', () => {
     expect(cache.shouldAlert('b', 100)).toBe(true);
   });
 
+  it('forget releases a reservation so the same block alerts again', () => {
+    const cache = new DedupCache();
+    expect(cache.shouldAlert('a', 100)).toBe(true);
+    cache.forget('a', 100);
+    expect(cache.shouldAlert('a', 100)).toBe(true); // as if never alerted
+  });
+
+  it('forget only clears the marker when it still points at that block', () => {
+    const cache = new DedupCache();
+    cache.shouldAlert('a', 100);
+    // A later, closer reservation moved the marker off 100 conceptually; forget
+    // for the stale block must not drop the live one.
+    cache.forget('a', 90);
+    expect(cache.shouldAlert('a', 100)).toBe(false); // 100 still suppressed
+  });
+
   it('evicts the oldest keys past the max size', () => {
     const cache = new DedupCache(5, 2);
     cache.shouldAlert('a', 100);

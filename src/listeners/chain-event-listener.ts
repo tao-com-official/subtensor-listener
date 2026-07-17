@@ -90,11 +90,22 @@ export class ChainEventListener {
   private head = -1;
 
   /**
-   * Low edge of the window we last covered. Blocks that drop below it without
-   * ever landing in {@link done} are the one and only place work is abandoned,
-   * and they are logged loudly there.
+   * Low edge of everything we still care about: `frontier - backfillBlocks + 1`,
+   * where the frontier is the highest head ever seen. **Monotonic** — it only
+   * rises. Both {@link done} and {@link attempted} are pruned to it, and work is
+   * floored at it, so a head that dips onto a lagging node can never make us
+   * re-scan (or re-alert) blocks that already aged out, and neither set can grow
+   * past the window.
    */
-  private windowFrom = -1;
+  private floor = -1;
+
+  /**
+   * Blocks we scanned but could not fully handle (unreadable, or the webhook
+   * was down). Retried every pass; kept only so that one still unhandled when it
+   * crosses {@link floor} can be reported as a genuine miss. Purely diagnostic —
+   * correctness does not depend on it — and bounded to the window like `done`.
+   */
+  private readonly attempted = new Set<number>();
 
   /**
    * Bumped whenever the pooled api instance is replaced. A scan that started on
@@ -173,18 +184,28 @@ export class ChainEventListener {
    * DEDUP_WINDOW_BLOCKS).
    */
   private async subscribeHeads(): Promise<void> {
-    const next = await this.api.rpc.chain.subscribeNewHeads((header) => {
+    const next = await this.subscribeOn(this.api);
+    // Tear down the old subscription only once the new one is live, so a
+    // failed subscribe can't leave us with no head feed.
+    const prev = this.unsubscribe;
+    this.unsubscribe = next;
+    prev?.();
+  }
+
+  /**
+   * Opens a head subscription on a specific api and returns its unsubscribe,
+   * committing nothing to `this`. Lets a reattach resolve the fallible subscribe
+   * before swapping any listener state, so a rejection leaves the old
+   * connection fully intact.
+   */
+  private subscribeOn(api: ApiPromise): Promise<() => void> {
+    return api.rpc.chain.subscribeNewHeads((header) => {
       const n = header.number.toNumber();
       // Heartbeat: one line per block so the logs show the service is
       // alive and keeping up, even when nothing matches.
       this.logger.log(`Block #${n} — watching ${this.eventLabel}`);
       this.onHead(n);
     });
-    // Tear down the old subscription only once the new one is live, so a
-    // failed subscribe can't leave us with no head feed.
-    const prev = this.unsubscribe;
-    this.unsubscribe = next;
-    prev?.();
   }
 
   /**
@@ -234,39 +255,40 @@ export class ChainEventListener {
     // — which needs no special handling: the work set is derived from this
     // node's head, so blocks it lacks are never asked for.
     if (api === this.api) {
+      // ...but if a start-time subscribe failed, we have no head feed at all.
+      // This reconnect is our chance to install one; otherwise the listener is
+      // blind on a connection that never gets replaced.
+      if (!this.unsubscribe) {
+        const unsub = await this.subscribeOn(api);
+        if (this.stopped) return unsub();
+        this.unsubscribe = unsub;
+      }
       const head = await this.scanner.bestNumber(api);
       if (this.stopped) return;
       this.onHead(head);
       return;
     }
 
-    // A fresh api (post-upgrade recreation). Resolve everything that can reject
-    // BEFORE committing to it: assigning this.api first meant a transient
-    // failure here left `api === this.api` true forever after, so every later
-    // reattach silently took the same-api branch and the boundary block was
-    // never re-read on the clean connection.
+    // A fresh api (post-upgrade recreation). Resolve EVERYTHING that can reject
+    // before touching listener state, then commit in one synchronous step, so a
+    // transient failure here leaves the old connection fully intact (rather than
+    // half-swapped: api reverted but apiGen bumped and done cleared or not).
     const head = await this.scanner.bestNumber(api);
     if (this.stopped) return;
+    const unsub = await this.subscribeOn(api);
+    if (this.stopped) return unsub();
 
-    const previous = this.api;
+    // Commit atomically — no awaits between these lines.
+    const prevUnsub = this.unsubscribe;
     this.api = api;
     this.apiGen++;
-    try {
-      await this.subscribeHeads();
-    } catch (err) {
-      this.api = previous; // let the retry see a fresh api again
-      throw err;
-    }
-    if (this.stopped) {
-      this.unsubscribe?.();
-      this.unsubscribe = undefined;
-      return;
-    }
-
+    this.unsubscribe = unsub;
     // Re-read the whole window on the clean-metadata connection: anything
     // scanned on the downgraded one may have mis-decoded. Dedup suppresses any
     // alert already delivered, so this is safe to repeat.
     this.done.clear();
+    this.attempted.clear();
+    prevUnsub?.();
     this.onHead(head);
   }
 
@@ -324,18 +346,13 @@ export class ChainEventListener {
     void this.drain();
   }
 
-  /** The window we are responsible for: the last `backfillBlocks` up to `head`. */
-  private windowOf(head: number): { from: number; to: number } {
-    return { from: Math.max(0, head - this.backfillBlocks + 1), to: head };
-  }
-
   /**
    * Scans every block in the window that isn't handled yet, and keeps going
    * until the window is covered or nothing more can be read right now.
    *
-   * The work is **derived** from `head` and {@link done} on every iteration
-   * rather than tracked incrementally, so a head that moves (forwards or
-   * backwards, e.g. onto a lagging node) or a {@link done} cleared by an
+   * The work is **derived** from `head`, {@link floor} and {@link done} on every
+   * iteration rather than tracked incrementally, so a head that moves (forwards
+   * or backwards, e.g. onto a lagging node) or a {@link done} cleared by an
    * upgrade recreate is picked up automatically instead of racing.
    */
   private async drain(): Promise<void> {
@@ -344,16 +361,17 @@ export class ChainEventListener {
     try {
       while (!this.stopped) {
         const head = this.head;
-        this.forgetOutsideWindow(head);
+        const gen = this.apiGen;
+        this.advanceFloor(head);
 
         const work = this.workFor(head);
         if (work.length === 0) break;
 
-        const handled = await this.scanBatches(work);
+        const handled = await this.scanBatches(work, gen);
         if (this.stopped) break;
         // The head moved or the connection was replaced under us — recompute
         // rather than act on a stale view.
-        if (this.head !== head) continue;
+        if (this.head !== head || this.apiGen !== gen) continue;
         // Nothing in the window could be read on this node right now (it is
         // behind, or the blocks genuinely fail). Stop rather than spin; the
         // next head re-enters and retries whatever is still missing.
@@ -366,64 +384,85 @@ export class ChainEventListener {
     }
   }
 
-  /** Blocks inside the window that aren't handled yet, oldest first. */
+  /** Blocks in `[floor, head]` that aren't handled yet, oldest first. */
   private workFor(head: number): number[] {
-    const { from, to } = this.windowOf(head);
     const work: number[] = [];
-    for (let n = from; n <= to; n++) if (!this.done.has(n)) work.push(n);
+    // Floored at `floor`, never at `head - backfillBlocks`: a head that dipped
+    // onto a lagging node must not drag the low edge back down and re-scan
+    // blocks that already aged out.
+    for (let n = this.floor; n <= head; n++) {
+      if (!this.done.has(n)) work.push(n);
+    }
     return work;
   }
 
   /**
    * Scans `work` in batches of {@link SCAN_CONCURRENCY}, returning whether any
-   * block was handled — i.e. whether this pass made progress at all.
+   * block was handled — i.e. whether this pass made progress at all. `gen` is
+   * the apiGen the caller derived the work under; a batch scanned after the
+   * connection was replaced says nothing about the current one and is dropped.
    */
-  private async scanBatches(work: number[]): Promise<boolean> {
+  private async scanBatches(work: number[], gen: number): Promise<boolean> {
     let handled = false;
     for (let i = 0; i < work.length; i += SCAN_CONCURRENCY) {
-      if (this.stopped) return handled;
+      if (this.stopped || this.apiGen !== gen) return handled;
       const batch = work.slice(i, i + SCAN_CONCURRENCY);
-      const gen = this.apiGen;
       const results = await Promise.all(batch.map((n) => this.handleBlock(n)));
-
-      // Results from a connection that has since been replaced say nothing
-      // about the current one — most importantly, a block scanned on the
-      // metadata-downgraded connection must not count as handled.
-      if (gen !== this.apiGen) return handled;
+      if (this.apiGen !== gen) return handled;
 
       batch.forEach((n, idx) => {
-        if (results[idx] !== BLOCK_OK) return;
-        this.done.add(n);
-        handled = true;
+        if (results[idx] === BLOCK_OK) {
+          this.done.add(n);
+          this.attempted.delete(n);
+          handled = true;
+        } else {
+          // Failed or not-on-this-node-yet: tried, not handled. Retried next
+          // pass; recorded so a genuine miss can be reported if it ages out.
+          this.attempted.add(n);
+        }
       });
-      // Every block above this node's head is unavailable too, so the rest of
-      // the window is a waste of round-trips. Nothing is dropped by stopping:
-      // whatever is missing simply stays out of `done` and returns as work.
-      if (results.includes(BLOCK_UNAVAILABLE)) return handled;
+      // No short-circuit on an unavailable block: work never runs above this
+      // node's head (it is derived from `head`), and availability is not
+      // monotone — a warp-synced node can lack an *old* block while serving
+      // newer ones, so abandoning the rest of the window here would strand
+      // blocks the node actually has.
     }
     return handled;
   }
 
   /**
-   * Drops the window's low edge, logging loudly for any block that leaves it
-   * without ever being handled. This is the one and only place work is
-   * abandoned — everything else keeps retrying.
+   * Raises {@link floor} to track the frontier, pruning both sets to it. This is
+   * the one and only place a block is abandoned: one that leaves the window
+   * still in {@link attempted} is a genuine miss and logged loudly, and a head
+   * that jumps far ahead (e.g. off a stale node onto a healthy one) is a bounded
+   * one-line summary rather than a per-block flood.
    */
-  private forgetOutsideWindow(head: number): void {
-    const { from } = this.windowOf(head);
-    if (this.windowFrom < 0) {
-      this.windowFrom = from;
+  private advanceFloor(head: number): void {
+    if (head < 0) return;
+    const next = head - this.backfillBlocks + 1;
+    if (this.floor < 0) {
+      // Seed on the first head; nothing below is expected yet.
+      this.floor = Math.max(0, next);
       return;
     }
-    for (let n = this.windowFrom; n < from; n++) {
-      if (!this.done.delete(n)) {
-        this.logger.error(
-          `Gave up on block ${n}: never read after ${this.backfillBlocks} blocks. ` +
-            `Any ${this.eventLabel} in it was NOT alerted.`,
-        );
-      }
+    if (next <= this.floor) return; // head dipped or held — floor only rises
+
+    if (next - this.floor > this.backfillBlocks) {
+      this.logger.warn(
+        `Skipping blocks ${this.floor}..${next - 1} ` +
+          `(beyond the ${this.backfillBlocks}-block window after a head jump).`,
+      );
     }
-    this.windowFrom = Math.max(this.windowFrom, from);
+    for (const n of this.attempted) {
+      if (n >= next) continue;
+      this.attempted.delete(n);
+      this.logger.error(
+        `Gave up on block ${n}: still unread after ${this.backfillBlocks} blocks. ` +
+          `Any ${this.eventLabel} in it was NOT alerted.`,
+      );
+    }
+    for (const n of this.done) if (n < next) this.done.delete(n);
+    this.floor = next;
   }
 
   /**
@@ -432,25 +471,34 @@ export class ChainEventListener {
    * actually been delivered.
    */
   private async handleBlock(blockNumber: number): Promise<BlockOutcome> {
+    const gen = this.apiGen;
     try {
       const matches = await this.scanner.scanBlock(
         this.api,
         blockNumber,
         this.def.events,
       );
+      // The connection was replaced while this scan was in flight — the classic
+      // case being the upgrade block scanned on the metadata-downgraded api at
+      // the moment the recreate fires. Its decode cannot be trusted, so do NOT
+      // deliver from it; the clean-connection re-scan will handle the block.
+      if (gen !== this.apiGen) return BLOCK_FAILED;
       for (const match of matches) {
         if (this.stopped) return BLOCK_FAILED;
         const key = dedupKey(this.def.network, match);
-        if (this.dedup.isDuplicate(key, blockNumber)) continue;
+        // Reserve synchronously (check-and-record in one turn): two blocks in
+        // the same concurrent batch carrying the same event must not both fire.
+        if (!this.dedup.shouldAlert(key, blockNumber)) continue;
         this.logger.log(
           `Matched ${match.pallet}.${match.event} in block ${blockNumber}.`,
         );
         const { sent } = await this.handleMatch(match, { send: true });
-        // A webhook that is briefly down must not cost us the alert: leave the
-        // block unhandled so the next head retries it, and leave the dedup
-        // marker unset so the retry isn't suppressed as a duplicate.
-        if (!sent) return BLOCK_FAILED;
-        this.dedup.remember(key, blockNumber);
+        // A webhook that is briefly down must not cost us the alert: release the
+        // reservation and leave the block unhandled so the next head retries it.
+        if (!sent) {
+          this.dedup.forget(key, blockNumber);
+          return BLOCK_FAILED;
+        }
       }
       return BLOCK_OK;
     } catch (err) {
