@@ -28,18 +28,23 @@ export class DedupCache {
   ) {}
 
   /**
-   * Reports whether an alert at `blockNumber` should fire for `key`, and
-   * records it if so. The window is symmetric (absolute distance) so a reorg
-   * that re-includes the event in a slightly *earlier* block is also caught.
+   * Whether an alert at `blockNumber` for `key` would repeat one we already
+   * delivered. The window is symmetric (absolute distance) so a reorg that
+   * re-includes the event in a slightly *earlier* block is also caught.
+   *
+   * Deliberately does **not** record anything: a delivery that then fails must
+   * stay retryable, so the marker is only laid down by {@link remember} once
+   * the alert is actually out.
    */
-  shouldAlert(key: string, blockNumber: number): boolean {
+  isDuplicate(key: string, blockNumber: number): boolean {
     const last = this.lastAlerted.get(key);
-    if (
-      last !== undefined &&
-      Math.abs(blockNumber - last) <= this.windowBlocks
-    ) {
-      return false;
-    }
+    return (
+      last !== undefined && Math.abs(blockNumber - last) <= this.windowBlocks
+    );
+  }
+
+  /** Records a *delivered* alert, so later repeats inside the window suppress. */
+  remember(key: string, blockNumber: number): void {
     this.lastAlerted.delete(key);
     this.lastAlerted.set(key, blockNumber);
     if (this.lastAlerted.size > this.maxSize) {
@@ -48,6 +53,16 @@ export class DedupCache {
         break;
       }
     }
+  }
+
+  /**
+   * Check-and-record in one step, for callers with nothing to fail in between.
+   * Suppressed matches do NOT move the marker, so a continuous stream of
+   * matching blocks still alerts once per window rather than never.
+   */
+  shouldAlert(key: string, blockNumber: number): boolean {
+    if (this.isDuplicate(key, blockNumber)) return false;
+    this.remember(key, blockNumber);
     return true;
   }
 

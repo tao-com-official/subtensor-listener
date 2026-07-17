@@ -81,6 +81,8 @@ describe('specVersionChange', () => {
 describe('ChainEventListener — lagging node / failed block handling', () => {
   const BACKFILL = 50;
   const UPGRADE_BLOCK = 8636190;
+  /** Mirrors SCAN_CONCURRENCY in the listener. */
+  const SCAN_CONCURRENCY = 5;
 
   const def: ListenerDefinition = {
     network: 'Finney Mainnet',
@@ -116,6 +118,8 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     readonly failOnce = new Set<number>();
     /** Blocks that never scan successfully (e.g. an undecodable block). */
     readonly failAlways = new Set<number>();
+    /** Blocks reported as "not on this node" on their next scan only. */
+    readonly unavailableOnce = new Set<number>();
     /** Hook fired as a scan starts — lets a test interleave a reconnect/stop. */
     onScan?: (n: number) => void;
 
@@ -126,6 +130,10 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
       this.onScan?.(n);
       if (n > this.available)
         return Promise.reject(new BlockUnavailableError(n));
+      if (this.unavailableOnce.has(n)) {
+        this.unavailableOnce.delete(n);
+        return Promise.reject(new BlockUnavailableError(n));
+      }
       if (this.failAlways.has(n)) {
         return Promise.reject(
           new Error('Unable to decode storage system.events'),
@@ -142,6 +150,8 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
   class FakeConnection {
     private headCb?: (h: { number: { toNumber: () => number } }) => void;
     private readonly handlers = new Set<() => void>();
+    /** Makes subscribeNewHeads reject, as a dropped socket really does. */
+    failSubscribe = false;
     api = this.newApi();
 
     private newApi() {
@@ -152,6 +162,9 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
             subscribeNewHeads: (
               cb: (h: { number: { toNumber: () => number } }) => void,
             ) => {
+              if (this.failSubscribe) {
+                return Promise.reject(new Error('disconnected'));
+              }
               this.headCb = cb;
               return Promise.resolve(() => undefined);
             },
@@ -188,19 +201,38 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
   let scanner: FakeScanner;
   let conn: FakeConnection;
   let sent: string[];
+  /** Attempted deliveries, including ones the webhook rejected. */
+  let attempted: string[];
+  /** When true the webhook rejects every POST (returns false, as it really does). */
+  let webhookDown: boolean;
+  let errors: string[];
   let listener: ChainEventListener;
 
   /** Let the drain loop's promise chain settle. */
   const flush = async () => {
-    for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
+    for (let i = 0; i < 60; i++) await new Promise((r) => setImmediate(r));
+  };
+
+  /** Advance the fake node one block and let the listener react. */
+  const headTo = async (n: number) => {
+    scanner.head = n;
+    scanner.available = n;
+    conn.emitHead(n);
+    await flush();
   };
 
   beforeEach(() => {
     scanner = new FakeScanner();
     conn = new FakeConnection();
     sent = [];
+    attempted = [];
+    errors = [];
+    webhookDown = false;
     const notifier = {
       send: (_t: unknown, msg: string) => {
+        attempted.push(msg);
+        // WebhookNotifier never throws — it returns false on failure.
+        if (webhookDown) return Promise.resolve(false);
         sent.push(msg);
         return Promise.resolve(true);
       },
@@ -214,7 +246,9 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
       BACKFILL,
     );
     jest.spyOn(listener['logger'], 'warn').mockImplementation(() => undefined);
-    jest.spyOn(listener['logger'], 'error').mockImplementation(() => undefined);
+    jest
+      .spyOn(listener['logger'], 'error')
+      .mockImplementation((m: unknown) => void errors.push(String(m)));
     jest.spyOn(listener['logger'], 'log').mockImplementation(() => undefined);
   });
 
@@ -231,64 +265,53 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     await listener.start();
     await flush();
 
-    // The failed block must NOT be treated as delivered.
-    expect(sent).toHaveLength(0);
-
-    // The next head retries it — this is what the old code never did.
-    scanner.head = UPGRADE_BLOCK + 1;
-    scanner.available = UPGRADE_BLOCK + 1;
-    conn.emitHead(UPGRADE_BLOCK + 1);
-    await flush();
-
+    // The block is not handed off as done on the failure: it stays in the work
+    // set and is re-derived, so the drain retries it without waiting for a new
+    // head (the work set is recomputed while the pass keeps making progress).
+    expect(scanner.scanned.filter((n) => n === UPGRADE_BLOCK).length).toBe(2);
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('CodeUpdated');
   });
 
-  it('does not demand blocks the node lacks when an upgrade recreate lands on a lagging node', async () => {
+  it('does not re-deliver a block already handled earlier in the same window', async () => {
     scanner.head = UPGRADE_BLOCK;
     scanner.available = UPGRADE_BLOCK;
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+    // One later block fails forever, forcing repeated drain passes over a window
+    // that already contains the delivered upgrade block.
+    scanner.failAlways.add(UPGRADE_BLOCK - 1);
+
     await listener.start();
     await flush();
+    for (let n = UPGRADE_BLOCK + 1; n <= UPGRADE_BLOCK + 4; n++)
+      await headTo(n);
 
-    // The upgrade recreates the connection and the fresh socket lands on the
-    // pool's other node, 25 blocks behind. The rewind re-covers the window on
-    // that node — and must stop at ITS head, not the previous node's.
-    const lagging = UPGRADE_BLOCK - 25;
-    scanner.scanned.length = 0;
-    scanner.head = lagging;
-    scanner.available = lagging;
-    conn.recreateApi();
-    conn.fireReconnect();
-    await flush();
-
-    // The rewind really ran (otherwise the assertion below passes vacuously).
-    expect(scanner.scanned.length).toBeGreaterThan(0);
-    expect(scanner.scanned.filter((n) => n > lagging)).toEqual([]);
+    // Handled blocks are in `done`, so they are never re-scanned or re-sent.
+    expect(sent).toHaveLength(1);
+    expect(scanner.scanned.filter((n) => n === UPGRADE_BLOCK).length).toBe(1);
   });
 
-  it('delivers the upgrade alert once the lagging node catches up to the block', async () => {
-    // Start on the node that is behind; the upgrade block is ahead of it.
-    scanner.head = UPGRADE_BLOCK - 25;
-    scanner.available = UPGRADE_BLOCK - 25;
+  it('never asks a lagging node for blocks above its head, and alerts once it catches up', async () => {
+    // Start on the node the LB gave us: 25 blocks behind, upgrade block ahead.
+    const lagging = UPGRADE_BLOCK - 25;
+    scanner.head = lagging;
+    scanner.available = lagging;
     scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
 
     await listener.start();
     await flush();
+    expect(scanner.scanned.length).toBeGreaterThan(0); // anti-vacuity
+    expect(scanner.scanned.filter((n) => n > lagging)).toEqual([]);
     expect(sent).toHaveLength(0);
 
     // The node catches up block by block.
-    for (let n = UPGRADE_BLOCK - 24; n <= UPGRADE_BLOCK; n++) {
-      scanner.head = n;
-      scanner.available = n;
-      conn.emitHead(n);
-      await flush();
-    }
+    for (let n = lagging + 1; n <= UPGRADE_BLOCK; n++) await headTo(n);
 
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('CodeUpdated');
   });
 
-  it('does not re-alert when a rewind re-scans an already-delivered block', async () => {
+  it('does not re-alert when an upgrade recreate re-scans an already-delivered block', async () => {
     scanner.head = UPGRADE_BLOCK;
     scanner.available = UPGRADE_BLOCK;
     scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
@@ -297,21 +320,18 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     await flush();
     expect(sent).toHaveLength(1);
 
-    // recreateApi() is what makes this a *rewind*: without it reattachOnce
-    // takes the same-api branch, nothing is re-scanned, and dedup is never
-    // exercised at all.
+    // recreateApi() is what makes this a re-scan: without it the same-api branch
+    // is taken, nothing is re-read, and dedup is never exercised at all.
     scanner.scanned.length = 0;
     conn.recreateApi();
     conn.fireReconnect();
     await flush();
 
-    expect(scanner.scanned).toContain(UPGRADE_BLOCK); // the rewind really re-scanned it
+    expect(scanner.scanned).toContain(UPGRADE_BLOCK); // it really was re-scanned
     expect(sent).toHaveLength(1); // ...and dedup suppressed the repeat
   });
 
   it('keeps alerting on later blocks while one block stays unreadable', async () => {
-    // The block that never reads — e.g. the documented "Unable to decode
-    // storage system.events" after a metadata downgrade.
     const STUCK = UPGRADE_BLOCK;
     scanner.head = STUCK;
     scanner.available = STUCK;
@@ -319,19 +339,14 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     await listener.start();
     await flush();
 
-    // Later blocks each carry a distinct alertable event.
     for (let n = STUCK + 1; n <= STUCK + 6; n++) {
       scanner.matches.set(n, [distinctEvent(n)]);
-      scanner.head = n;
-      scanner.available = n;
-      conn.emitHead(n);
-      await flush();
+      await headTo(n);
     }
 
-    // Pre-rework this was a ~10-minute blackout: the cursor stalled at STUCK-1
-    // and nothing after it was ever scanned.
+    // Previously the cursor stalled behind STUCK and blacked out everything.
     expect(sent).toHaveLength(6);
-    // ...and the stuck block is still being retried, not forgotten.
+    // ...and the stuck block is still retried, not forgotten.
     expect(scanner.scanned.filter((n) => n === STUCK).length).toBeGreaterThan(
       1,
     );
@@ -353,37 +368,80 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     await listener.start();
     await flush();
 
-    // The rewind must survive the in-flight drain writing its stale cursor back.
-    const rescans = scanner.scanned.filter((n) => n === UPGRADE_BLOCK).length;
-    expect(rescans).toBeGreaterThan(1);
-    expect(sent).toHaveLength(1); // delivered once, dedup covers the re-read
+    // The scan that ran on the doomed connection must not count as handled.
+    expect(
+      scanner.scanned.filter((n) => n === UPGRADE_BLOCK).length,
+    ).toBeGreaterThan(1);
+    expect(sent).toHaveLength(1);
   });
 
-  it('does not scan past a lagging node head on a plain socket reconnect', async () => {
+  it('does not lose the blocks after a batch that hit an unavailable block', async () => {
+    // The regression from the previous attempt: the batch short-circuit dropped
+    // every block after the failing batch. Node has everything except a hole
+    // starting mid-window, and the upgrade block sits beyond it.
+    const HOLE = UPGRADE_BLOCK - 10;
     scanner.head = UPGRADE_BLOCK;
     scanner.available = UPGRADE_BLOCK;
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+    // Make exactly one block report "not on this node yet", once.
+    scanner.unavailableOnce.add(HOLE);
+
     await listener.start();
     await flush();
+    // Next head re-derives the work set; nothing may have been skipped.
+    await headTo(UPGRADE_BLOCK + 1);
 
-    // Same ApiPromise instance (no recreate) — but the provider re-resolved DNS
-    // and the socket is now pinned to a node 25 blocks behind.
-    const lagging = UPGRADE_BLOCK - 25;
-    scanner.scanned.length = 0;
-    scanner.head = lagging;
-    scanner.available = lagging;
-    conn.fireReconnect();
-    await flush();
-
-    expect(scanner.scanned.filter((n) => n > lagging)).toEqual([]);
+    expect(scanner.scanned).toContain(HOLE);
+    expect(scanner.scanned).toContain(UPGRADE_BLOCK);
+    expect(sent).toHaveLength(1); // the alert beyond the hole still went out
   });
 
-  it('stops delivering once stopped, even mid-drain', async () => {
+  it('retries the alert when the webhook is briefly down', async () => {
     scanner.head = UPGRADE_BLOCK;
     scanner.available = UPGRADE_BLOCK;
-    for (let n = UPGRADE_BLOCK - 40; n <= UPGRADE_BLOCK; n++) {
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+    webhookDown = true;
+
+    await listener.start();
+    await flush();
+    expect(attempted.length).toBeGreaterThan(0); // anti-vacuity: it did try
+    expect(sent).toHaveLength(0);
+
+    // Webhook recovers; the block must be retried and the alert delivered.
+    webhookDown = false;
+    await headTo(UPGRADE_BLOCK + 1);
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('CodeUpdated');
+  });
+
+  it('logs loudly when a block leaves the window unread', async () => {
+    const STUCK = UPGRADE_BLOCK;
+    scanner.head = STUCK;
+    scanner.available = STUCK;
+    scanner.failAlways.add(STUCK);
+    await listener.start();
+    await flush();
+    expect(errors.some((e) => e.includes(`Gave up on block ${STUCK}`))).toBe(
+      false,
+    );
+
+    // Walk the head past the backfill window so STUCK drops out of it.
+    for (let n = STUCK + 1; n <= STUCK + BACKFILL + 1; n++) await headTo(n);
+
+    expect(errors.some((e) => e.includes(`Gave up on block ${STUCK}`))).toBe(
+      true,
+    );
+    expect(errors.some((e) => e.includes('NOT alerted'))).toBe(true);
+  });
+
+  it('stops scanning and delivering once stopped, even mid-drain', async () => {
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    // Every block in the backfill window carries a distinct alert.
+    for (let n = UPGRADE_BLOCK - BACKFILL + 1; n <= UPGRADE_BLOCK; n++) {
       scanner.matches.set(n, [distinctEvent(n)]);
     }
-    // Stop as soon as the drain touches its first block.
     scanner.onScan = () => {
       scanner.onScan = undefined;
       listener.stop();
@@ -392,10 +450,30 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     await listener.start();
     await flush();
 
-    // A 41-block backfill would otherwise deliver dozens of webhooks.
+    // Without the stopped guards this delivers dozens of webhooks and scans the
+    // whole window against a connection being torn down.
     expect(sent.length).toBeLessThanOrEqual(1);
-    // ...and the drain must abandon the remaining batches rather than scan all
-    // 41 blocks against a connection that is being torn down under it.
-    expect(scanner.scanned.length).toBeLessThanOrEqual(5);
+    expect(scanner.scanned.length).toBeLessThanOrEqual(SCAN_CONCURRENCY);
+  });
+
+  it('keeps the reconnect handler when subscribing to heads fails at startup', async () => {
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    conn.failSubscribe = true;
+
+    await expect(listener.start()).rejects.toThrow();
+    // Let the drain start() kicked off before subscribing run itself out, so
+    // the assertion below can only be satisfied by the reconnect path.
+    await flush();
+    expect(sent).toHaveLength(0);
+
+    // The listener must still be revivable: a later reconnect has to reach it.
+    conn.failSubscribe = false;
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+    conn.recreateApi();
+    conn.fireReconnect();
+    await flush();
+
+    expect(sent).toHaveLength(1);
   });
 });
