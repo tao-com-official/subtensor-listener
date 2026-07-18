@@ -35,6 +35,18 @@ export interface ReplayResult {
   events: ReplayedEvent[];
 }
 
+/** Progress snapshot for the health check. */
+export interface ListenerLiveness {
+  network: string;
+  /** Best head this listener has observed (-1 before the first). */
+  head: number;
+  /** Wall-clock ms of the last head observed, or null if none yet. */
+  lastHeadAtMs: number | null;
+  /** Wall-clock ms when start() began, or null if never started. */
+  startedAtMs: number | null;
+  stopped: boolean;
+}
+
 /** How many blocks to scan concurrently while backfilling a range. */
 const SCAN_CONCURRENCY = 5;
 
@@ -118,6 +130,10 @@ export class ChainEventListener {
   private draining = false;
   private stopped = false;
 
+  /** When start() began, and when the last head was observed (for liveness). */
+  private startedAtMs: number | null = null;
+  private lastHeadAtMs: number | null = null;
+
   /** Serializes reattach() so racing reconnect signals can't leak head subs. */
   private reattaching = false;
   private reattachQueued = false;
@@ -138,6 +154,7 @@ export class ChainEventListener {
   }
 
   async start(): Promise<void> {
+    this.startedAtMs = Date.now();
     // Registered FIRST, before anything that can reject. If subscribing to
     // heads throws, this handler is what revives the listener on the next
     // reconnect; registering it afterwards left a failed start permanently
@@ -353,8 +370,22 @@ export class ChainEventListener {
   /** Records the current socket's best block and kicks the drain. */
   private onHead(head: number): void {
     if (this.stopped || head < 0) return;
+    // A fresh head means the feed is alive — the liveness signal the health
+    // check reads to tell a keeping-up listener from a stalled one.
+    this.lastHeadAtMs = Date.now();
     this.head = head;
     void this.drain();
+  }
+
+  /** Progress snapshot for the health check. */
+  liveness(): ListenerLiveness {
+    return {
+      network: this.def.network,
+      head: this.head,
+      lastHeadAtMs: this.lastHeadAtMs,
+      startedAtMs: this.startedAtMs,
+      stopped: this.stopped,
+    };
   }
 
   /**
