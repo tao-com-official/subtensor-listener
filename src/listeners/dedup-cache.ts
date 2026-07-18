@@ -29,8 +29,15 @@ export class DedupCache {
 
   /**
    * Reports whether an alert at `blockNumber` should fire for `key`, and
-   * records it if so. The window is symmetric (absolute distance) so a reorg
-   * that re-includes the event in a slightly *earlier* block is also caught.
+   * **records it synchronously if so** — check and record are one atomic step,
+   * so two blocks scanned concurrently (same batch) carrying the same event
+   * can't both slip through. The window is symmetric (absolute distance) so a
+   * reorg re-including the event in a slightly *earlier* block is also caught.
+   * Suppressed matches do NOT move the marker, so a continuous stream still
+   * alerts once per window rather than never.
+   *
+   * A reservation made here can be released with {@link forget} if the delivery
+   * it was for then fails, so a transient webhook outage doesn't cost the alert.
    */
   shouldAlert(key: string, blockNumber: number): boolean {
     const last = this.lastAlerted.get(key);
@@ -49,6 +56,23 @@ export class DedupCache {
       }
     }
     return true;
+  }
+
+  /**
+   * Undoes a {@link shouldAlert} reservation for a delivery that then failed,
+   * so the block can be retried. Only clears the marker if it still points at
+   * this block — a later reservation for the same key must not be dropped.
+   *
+   * The cache keeps a single marker per key, so this cannot restore an *earlier*
+   * suppressed position: if a delivery beyond the window moved the marker and
+   * then failed, forgetting it drops the marker entirely, and a reorg landing
+   * within the window of a still-earlier delivery could re-alert. That needs a
+   * failed out-of-window delivery followed by an in-window reorg before the
+   * retry — rare, and it duplicates rather than loses — so the single-marker
+   * simplicity is kept deliberately.
+   */
+  forget(key: string, blockNumber: number): void {
+    if (this.lastAlerted.get(key) === blockNumber) this.lastAlerted.delete(key);
   }
 
   get size(): number {
