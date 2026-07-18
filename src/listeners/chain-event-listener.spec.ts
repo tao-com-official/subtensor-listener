@@ -386,25 +386,53 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     expect(sent).toHaveLength(1);
   });
 
-  it('does not lose the blocks after a batch that hit an unavailable block', async () => {
-    // The regression from the previous attempt: the batch short-circuit dropped
-    // every block after the failing batch. Node has everything except a hole
-    // starting mid-window, and the upgrade block sits beyond it.
-    const HOLE = UPGRADE_BLOCK - 10;
+  it('scans past an all-unavailable oldest batch to reach newer blocks in a stalled window', async () => {
+    // Pins the removal of the batch short-circuit. The oldest whole batch is
+    // permanently unavailable (a warp-synced node pruned those blocks), the
+    // upgrade alert sits at the head, and the head does NOT advance — so the
+    // no-cursor re-derivation cannot mask a short-circuit by creeping forward.
+    // A short-circuit on the first (all-unavailable) batch would make no
+    // progress, break the drain, and never reach the alert.
     scanner.head = UPGRADE_BLOCK;
     scanner.available = UPGRADE_BLOCK;
+    const floorBlock = UPGRADE_BLOCK - BACKFILL + 1;
+    for (let n = floorBlock; n < floorBlock + SCAN_CONCURRENCY; n++) {
+      scanner.unavailableAlways.add(n);
+    }
     scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
-    // Make exactly one block report "not on this node yet", once.
-    scanner.unavailableOnce.add(HOLE);
 
     await listener.start();
     await flush();
-    // Next head re-derives the work set; nothing may have been skipped.
-    await headTo(UPGRADE_BLOCK + 1);
 
-    expect(scanner.scanned).toContain(HOLE);
-    expect(scanner.scanned).toContain(UPGRADE_BLOCK);
-    expect(sent).toHaveLength(1); // the alert beyond the hole still went out
+    expect(scanner.scanned).toContain(UPGRADE_BLOCK); // reached past the dead batch
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('CodeUpdated');
+  });
+
+  it('preserves the miss record across an upgrade recreate, so a lost block is logged not silent', async () => {
+    // A block fails to decode on the downgraded connection (→ attempted), the
+    // upgrade recreates the api, and the fresh socket lands on a node so far
+    // ahead that the block ages out before it can be re-read. It must surface as
+    // a loud "Gave up" error, not vanish because attempted was cleared.
+    const LOST = UPGRADE_BLOCK;
+    scanner.head = LOST;
+    scanner.available = LOST;
+    scanner.failAlways.add(LOST); // never decodes on this connection
+    await listener.start();
+    await flush();
+    expect(listener['attempted'].has(LOST)).toBe(true);
+
+    // Recreate onto a node far ahead; the block is now below the window.
+    scanner.failAlways.delete(LOST); // even though it could read now, it aged out
+    scanner.head = LOST + BACKFILL + 10;
+    scanner.available = scanner.head;
+    conn.recreateApi();
+    conn.fireReconnect();
+    await flush();
+
+    expect(errors.some((e) => e.includes(`Gave up on block ${LOST}`))).toBe(
+      true,
+    );
   });
 
   it('retries the alert when the webhook is briefly down', async () => {
@@ -553,8 +581,12 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
 
     // Must NOT emit millions of error lines / block the loop.
     expect(errors.length).toBeLessThan(5);
-    // A single summary of the skipped span is fine.
-    expect(warns.some((w) => w.includes('Skipping blocks'))).toBe(true);
+    // A single summary of the skipped span — and it must start ABOVE the first
+    // window (951..1000 were backfilled and delivered), not blame them.
+    const summary = warns.find((w) => w.includes('Skipping blocks'));
+    expect(summary).toBeDefined();
+    expect(summary).toContain('Skipping blocks 1001..'); // = floor(951) + BACKFILL
+    expect(summary).not.toContain('951..');
   });
 
   it('keeps alerting on recent blocks a warp-synced node has, despite an unavailable old block', async () => {

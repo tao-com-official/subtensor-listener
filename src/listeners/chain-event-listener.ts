@@ -286,8 +286,12 @@ export class ChainEventListener {
     // Re-read the whole window on the clean-metadata connection: anything
     // scanned on the downgraded one may have mis-decoded. Dedup suppresses any
     // alert already delivered, so this is safe to repeat.
+    //
+    // `attempted` is deliberately NOT cleared: those blocks failed to scan and
+    // we still owe them a look. Dropping them would erase the record that lets
+    // a block failed on the old connection be reported as a genuine miss if it
+    // later ages out — turning exactly the incident (a lost CodeUpdated) silent.
     this.done.clear();
-    this.attempted.clear();
     prevUnsub?.();
     this.onHead(head);
   }
@@ -318,11 +322,19 @@ export class ChainEventListener {
     await api.isReady;
 
     const blockNumber = await this.resolveBlockNumber(api, blockRef);
-    const matches = await this.scanner.scanBlock(
-      api,
-      blockNumber,
-      this.def.events,
-    );
+    let matches: MatchedEvent[];
+    try {
+      matches = await this.scanner.scanBlock(api, blockNumber, this.def.events);
+    } catch (err) {
+      // A load-balanced socket may currently be pinned to a node that lacks this
+      // block; give the caller that instead of an opaque 500.
+      if (err instanceof BlockUnavailableError) {
+        throw new Error(
+          `Block ${blockNumber} is not available on the connected node right now; retry.`,
+        );
+      }
+      throw err;
+    }
 
     const events: ReplayedEvent[] = [];
     for (const match of matches) {
@@ -375,6 +387,12 @@ export class ChainEventListener {
         // Nothing in the window could be read on this node right now (it is
         // behind, or the blocks genuinely fail). Stop rather than spin; the
         // next head re-enters and retries whatever is still missing.
+        //
+        // Progress is head-driven: if the node keeps its socket open but stops
+        // emitting heads entirely, a still-unread block is neither retried nor
+        // (until a head finally advances the floor) reported as a miss. That is
+        // a connection-liveness failure — the RPC health check owns detecting a
+        // silent peer — not something the drain can resolve on its own.
         if (!handled) break;
       }
     } catch (err) {
@@ -447,10 +465,16 @@ export class ChainEventListener {
     }
     if (next <= this.floor) return; // head dipped or held — floor only rises
 
-    if (next - this.floor > this.backfillBlocks) {
+    // The blocks that were never even in a window: everything above the previous
+    // frontier (this.floor + backfillBlocks - 1) up to the new window's bottom.
+    // The old floor's low blocks were already in the previous window (handled,
+    // or given up per-block below), so reporting from `this.floor` would blame
+    // successfully-processed blocks.
+    const neverSeenFrom = this.floor + this.backfillBlocks;
+    if (neverSeenFrom <= next - 1) {
       this.logger.warn(
-        `Skipping blocks ${this.floor}..${next - 1} ` +
-          `(beyond the ${this.backfillBlocks}-block window after a head jump).`,
+        `Skipping blocks ${neverSeenFrom}..${next - 1} ` +
+          `(never in the ${this.backfillBlocks}-block window after a head jump).`,
       );
     }
     for (const n of this.attempted) {
@@ -482,6 +506,14 @@ export class ChainEventListener {
       // case being the upgrade block scanned on the metadata-downgraded api at
       // the moment the recreate fires. Its decode cannot be trusted, so do NOT
       // deliver from it; the clean-connection re-scan will handle the block.
+      //
+      // This guards the *scan*, which is where the downgrade actually bites: a
+      // downgraded connection fails to decode and throws (see
+      // ChainConnectionService), landing in the catch below, not here. A recreate
+      // that instead fires during the delivery await further down cannot be
+      // un-sent; we accept that a decode which was valid at scan time is
+      // delivered, rather than re-checking and risking a double-alert on every
+      // routine reconnect.
       if (gen !== this.apiGen) return BLOCK_FAILED;
       for (const match of matches) {
         if (this.stopped) return BLOCK_FAILED;
