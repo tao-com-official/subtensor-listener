@@ -62,6 +62,14 @@ export class DedupCache {
    * Undoes a {@link shouldAlert} reservation for a delivery that then failed,
    * so the block can be retried. Only clears the marker if it still points at
    * this block — a later reservation for the same key must not be dropped.
+   *
+   * The cache keeps a single marker per key, so this cannot restore an *earlier*
+   * suppressed position: if a delivery beyond the window moved the marker and
+   * then failed, forgetting it drops the marker entirely, and a reorg landing
+   * within the window of a still-earlier delivery could re-alert. That needs a
+   * failed out-of-window delivery followed by an in-window reorg before the
+   * retry — rare, and it duplicates rather than loses — so the single-marker
+   * simplicity is kept deliberately.
    */
   forget(key: string, blockNumber: number): void {
     if (this.lastAlerted.get(key) === blockNumber) this.lastAlerted.delete(key);

@@ -76,8 +76,15 @@ export class ChainEventListener {
    * failure mode exists to choose between.
    *
    * Bounded by construction: only blocks inside the current window are ever
-   * kept (see {@link forgetOutsideWindow}), so it can hold at most
-   * `backfillBlocks` entries.
+   * kept (pruned to {@link floor} in {@link advanceFloor}), so it can hold at
+   * most `backfillBlocks` entries.
+   *
+   * Deliberately NOT cleared on a runtime-upgrade recreate. A block that failed
+   * to decode on the downgraded connection throws (see ChainConnectionService),
+   * so it never entered `done` in the first place and is re-scanned on the clean
+   * connection as ordinary work. Only blocks that decoded and delivered
+   * correctly are here, and clearing them would both re-do delivered work and
+   * erase the record that distinguishes a delivered block from a genuine miss.
    */
   private readonly done = new Set<number>();
 
@@ -89,23 +96,16 @@ export class ChainEventListener {
    */
   private head = -1;
 
-  /**
-   * Low edge of everything we still care about: `frontier - backfillBlocks + 1`,
-   * where the frontier is the highest head ever seen. **Monotonic** — it only
-   * rises. Both {@link done} and {@link attempted} are pruned to it, and work is
-   * floored at it, so a head that dips onto a lagging node can never make us
-   * re-scan (or re-alert) blocks that already aged out, and neither set can grow
-   * past the window.
-   */
-  private floor = -1;
+  /** Highest head ever seen. Monotonic; drives {@link floor} and the miss log. */
+  private frontier = -1;
 
   /**
-   * Blocks we scanned but could not fully handle (unreadable, or the webhook
-   * was down). Retried every pass; kept only so that one still unhandled when it
-   * crosses {@link floor} can be reported as a genuine miss. Purely diagnostic —
-   * correctness does not depend on it — and bounded to the window like `done`.
+   * Low edge of everything we still care about: `frontier - backfillBlocks + 1`.
+   * **Monotonic**. {@link done} is pruned to it and work is floored at it, so a
+   * head that dips onto a lagging node can never make us re-scan (or re-alert)
+   * blocks that already aged out, and `done` can't grow past the window.
    */
-  private readonly attempted = new Set<number>();
+  private floor = -1;
 
   /**
    * Bumped whenever the pooled api instance is replaced. A scan that started on
@@ -272,7 +272,7 @@ export class ChainEventListener {
     // A fresh api (post-upgrade recreation). Resolve EVERYTHING that can reject
     // before touching listener state, then commit in one synchronous step, so a
     // transient failure here leaves the old connection fully intact (rather than
-    // half-swapped: api reverted but apiGen bumped and done cleared or not).
+    // half-swapped: api reverted but apiGen bumped).
     const head = await this.scanner.bestNumber(api);
     if (this.stopped) return;
     const unsub = await this.subscribeOn(api);
@@ -283,15 +283,14 @@ export class ChainEventListener {
     this.api = api;
     this.apiGen++;
     this.unsubscribe = unsub;
-    // Re-read the whole window on the clean-metadata connection: anything
-    // scanned on the downgraded one may have mis-decoded. Dedup suppresses any
-    // alert already delivered, so this is safe to repeat.
-    //
-    // `attempted` is deliberately NOT cleared: those blocks failed to scan and
-    // we still owe them a look. Dropping them would erase the record that lets
-    // a block failed on the old connection be reported as a genuine miss if it
-    // later ages out — turning exactly the incident (a lost CodeUpdated) silent.
-    this.done.clear();
+    // `done` is deliberately NOT cleared. Blocks that failed on the downgraded
+    // connection threw and never entered `done`, so they are already re-scanned
+    // as ordinary work on the clean connection; blocks that are in `done`
+    // decoded and delivered correctly and need no re-scan. Clearing it would
+    // erase the record that tells a delivered block from a genuine miss (a
+    // failed re-scan would then log a false "NOT alerted"), and re-scanning a
+    // window whose low blocks got dropped by a far-ahead node's floor jump would
+    // lose them silently.
     prevUnsub?.();
     this.onHead(head);
   }
@@ -364,8 +363,8 @@ export class ChainEventListener {
    *
    * The work is **derived** from `head`, {@link floor} and {@link done} on every
    * iteration rather than tracked incrementally, so a head that moves (forwards
-   * or backwards, e.g. onto a lagging node) or a {@link done} cleared by an
-   * upgrade recreate is picked up automatically instead of racing.
+   * or backwards, e.g. onto a lagging node) is picked up automatically instead
+   * of racing.
    */
   private async drain(): Promise<void> {
     if (this.draining) return;
@@ -428,15 +427,14 @@ export class ChainEventListener {
       const results = await Promise.all(batch.map((n) => this.handleBlock(n)));
       if (this.apiGen !== gen) return handled;
 
+      // Only a fully-handled block is recorded. A block that failed or isn't on
+      // this node yet simply stays out of `done`, so it returns as work next
+      // pass; if it ages out of the window unhandled, advanceFloor derives the
+      // miss from its absence in `done` — no side record needed.
       batch.forEach((n, idx) => {
         if (results[idx] === BLOCK_OK) {
           this.done.add(n);
-          this.attempted.delete(n);
           handled = true;
-        } else {
-          // Failed or not-on-this-node-yet: tried, not handled. Retried next
-          // pass; recorded so a genuine miss can be reported if it ages out.
-          this.attempted.add(n);
         }
       });
       // No short-circuit on an unavailable block: work never runs above this
@@ -449,40 +447,48 @@ export class ChainEventListener {
   }
 
   /**
-   * Raises {@link floor} to track the frontier, pruning both sets to it. This is
-   * the one and only place a block is abandoned: one that leaves the window
-   * still in {@link attempted} is a genuine miss and logged loudly, and a head
-   * that jumps far ahead (e.g. off a stale node onto a healthy one) is a bounded
-   * one-line summary rather than a per-block flood.
+   * Advances {@link frontier} and {@link floor}, pruning {@link done} and
+   * accounting for every block that leaves the window. This is the one and only
+   * place a block is abandoned, and the accounting is **derived from `done`**,
+   * not from a side record: a block that was in a window we were responsible for
+   * (at or below the *previous* frontier) but is not in `done` is a genuine miss
+   * and logged loudly; blocks a head jump flew clean past (above the previous
+   * frontier) were never in any window and get one bounded summary line.
+   *
+   * Deriving the miss from `done` is what makes it robust: it doesn't matter
+   * whether the block was scanned-and-failed, never reached (an in-flight batch
+   * discarded by a recreate), or anything else — if it aged out unhandled, it is
+   * reported. The responsible span is at most `backfillBlocks` wide, so the loud
+   * loop is bounded even when the head jumps millions ahead.
    */
   private advanceFloor(head: number): void {
     if (head < 0) return;
-    const next = head - this.backfillBlocks + 1;
+    const prevFrontier = this.frontier;
+    if (head > this.frontier) this.frontier = head;
+
+    const next = Math.max(0, this.frontier - this.backfillBlocks + 1);
     if (this.floor < 0) {
-      // Seed on the first head; nothing below is expected yet.
-      this.floor = Math.max(0, next);
+      this.floor = next; // seed on the first head; nothing below is expected
       return;
     }
     if (next <= this.floor) return; // head dipped or held — floor only rises
 
-    // The blocks that were never even in a window: everything above the previous
-    // frontier (this.floor + backfillBlocks - 1) up to the new window's bottom.
-    // The old floor's low blocks were already in the previous window (handled,
-    // or given up per-block below), so reporting from `this.floor` would blame
-    // successfully-processed blocks.
-    const neverSeenFrom = this.floor + this.backfillBlocks;
-    if (neverSeenFrom <= next - 1) {
-      this.logger.warn(
-        `Skipping blocks ${neverSeenFrom}..${next - 1} ` +
-          `(never in the ${this.backfillBlocks}-block window after a head jump).`,
+    // Blocks leaving the window that we were responsible for (reachable at or
+    // below the previous frontier) and never handled: a genuine miss.
+    const missTop = Math.min(prevFrontier, next - 1);
+    for (let n = this.floor; n <= missTop; n++) {
+      if (this.done.has(n)) continue;
+      this.logger.error(
+        `Gave up on block ${n}: never handled before it left the ` +
+          `${this.backfillBlocks}-block window. Any ${this.eventLabel} in it was NOT alerted.`,
       );
     }
-    for (const n of this.attempted) {
-      if (n >= next) continue;
-      this.attempted.delete(n);
-      this.logger.error(
-        `Gave up on block ${n}: still unread after ${this.backfillBlocks} blocks. ` +
-          `Any ${this.eventLabel} in it was NOT alerted.`,
+    // Blocks above the previous frontier that the head jumped clean over — never
+    // in any window; one bounded summary rather than a per-block flood.
+    if (prevFrontier + 1 <= next - 1) {
+      this.logger.warn(
+        `Skipping blocks ${prevFrontier + 1}..${next - 1} ` +
+          `(never in the ${this.backfillBlocks}-block window after a head jump).`,
       );
     }
     for (const n of this.done) if (n < next) this.done.delete(n);

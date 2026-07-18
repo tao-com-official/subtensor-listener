@@ -322,26 +322,6 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     expect(sent[0]).toContain('CodeUpdated');
   });
 
-  it('does not re-alert when an upgrade recreate re-scans an already-delivered block', async () => {
-    scanner.head = UPGRADE_BLOCK;
-    scanner.available = UPGRADE_BLOCK;
-    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
-
-    await listener.start();
-    await flush();
-    expect(sent).toHaveLength(1);
-
-    // recreateApi() is what makes this a re-scan: without it the same-api branch
-    // is taken, nothing is re-read, and dedup is never exercised at all.
-    scanner.scanned.length = 0;
-    conn.recreateApi();
-    conn.fireReconnect();
-    await flush();
-
-    expect(scanner.scanned).toContain(UPGRADE_BLOCK); // it really was re-scanned
-    expect(sent).toHaveLength(1); // ...and dedup suppressed the repeat
-  });
-
   it('keeps alerting on later blocks while one block stays unreadable', async () => {
     const STUCK = UPGRADE_BLOCK;
     scanner.head = STUCK;
@@ -409,18 +389,20 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     expect(sent[0]).toContain('CodeUpdated');
   });
 
-  it('preserves the miss record across an upgrade recreate, so a lost block is logged not silent', async () => {
-    // A block fails to decode on the downgraded connection (→ attempted), the
-    // upgrade recreates the api, and the fresh socket lands on a node so far
-    // ahead that the block ages out before it can be re-read. It must surface as
-    // a loud "Gave up" error, not vanish because attempted was cleared.
+  it('loudly logs a block lost across an upgrade recreate, never silently', async () => {
+    // A block fails to decode on the downgraded connection, the upgrade recreates
+    // the api, and the fresh socket lands on a node so far ahead that the block
+    // ages out before it can be re-read. The miss is derived from its absence in
+    // `done`, so it must surface as a loud "Gave up" error, not vanish.
     const LOST = UPGRADE_BLOCK;
     scanner.head = LOST;
     scanner.available = LOST;
     scanner.failAlways.add(LOST); // never decodes on this connection
     await listener.start();
     await flush();
-    expect(listener['attempted'].has(LOST)).toBe(true);
+    // Anti-vacuity: it was scanned and left unhandled (not in done).
+    expect(scanner.scanned).toContain(LOST);
+    expect(listener['done'].has(LOST)).toBe(false);
 
     // Recreate onto a node far ahead; the block is now below the window.
     scanner.failAlways.delete(LOST); // even though it could read now, it aged out
@@ -433,6 +415,32 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     expect(errors.some((e) => e.includes(`Gave up on block ${LOST}`))).toBe(
       true,
     );
+  });
+
+  it('does not falsely report an already-delivered block as a miss after a recreate', async () => {
+    // Block delivered on the old connection, then an upgrade recreate. Because
+    // `done` is preserved (not cleared), it must NOT be re-scanned or logged as
+    // "NOT alerted" even if the fresh node is far ahead.
+    const DELIVERED = UPGRADE_BLOCK;
+    scanner.head = DELIVERED;
+    scanner.available = DELIVERED;
+    scanner.matches.set(DELIVERED, [codeUpdated(DELIVERED)]);
+    await listener.start();
+    await flush();
+    expect(sent).toHaveLength(1); // anti-vacuity: it really was delivered
+
+    scanner.scanned.length = 0;
+    scanner.head = DELIVERED + BACKFILL + 10;
+    scanner.available = scanner.head;
+    conn.recreateApi();
+    conn.fireReconnect();
+    await flush();
+
+    expect(scanner.scanned).not.toContain(DELIVERED); // not re-scanned
+    expect(
+      errors.some((e) => e.includes(`Gave up on block ${DELIVERED}`)),
+    ).toBe(false);
+    expect(sent).toHaveLength(1); // and certainly not re-alerted
   });
 
   it('retries the alert when the webhook is briefly down', async () => {
@@ -506,14 +514,18 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     await flush();
     expect(sent).toHaveLength(0);
 
-    // The listener must still be revivable: a later reconnect has to reach it.
+    // The listener must still be revivable: a later reconnect (here a full
+    // recreate) has to reach it. Prove the feed is live via a NEW head, since
+    // the backfilled window is already handled and won't re-alert.
     conn.failSubscribe = false;
-    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
     conn.recreateApi();
     conn.fireReconnect();
     await flush();
 
+    scanner.matches.set(UPGRADE_BLOCK + 1, [codeUpdated(UPGRADE_BLOCK + 1)]);
+    await headTo(UPGRADE_BLOCK + 1);
     expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain(`#${UPGRADE_BLOCK + 1}`);
   });
 
   it('revives the head feed on a plain (same-api) reconnect after a failed startup subscribe', async () => {
@@ -587,6 +599,35 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     expect(summary).toBeDefined();
     expect(summary).toContain('Skipping blocks 1001..'); // = floor(951) + BACKFILL
     expect(summary).not.toContain('951..');
+  });
+
+  it('accounts for the head correctly near genesis (first head below the window)', async () => {
+    // Fresh chain: the first head is below backfillBlocks, so the derived floor
+    // clamps to 0 — the explicit frontier is what keeps the miss/skip split
+    // honest. Block 5 carries an alert that fails to decode; a later jump must
+    // give it up loudly and summarise only the genuinely-never-seen span.
+    scanner.head = 10;
+    scanner.available = 10;
+    scanner.failAlways.add(5);
+    await listener.start();
+    await flush();
+    expect(scanner.scanned).toContain(5); // it was in the genesis window
+
+    scanner.head = 5000;
+    scanner.available = 5000;
+    conn.fireReconnect();
+    await flush();
+
+    // Block 5 was reachable (head reached 10) and never handled → loud miss.
+    expect(errors.some((e) => e.includes('Gave up on block 5'))).toBe(true);
+    // But block 30 never existed (the genesis head was only 10). Deriving the
+    // responsible window from the clamped floor (0 + backfillBlocks) would
+    // falsely "Gave up" on it; the explicit frontier (10) must not.
+    expect(errors.some((e) => e.includes('Gave up on block 30'))).toBe(false);
+    // The never-seen summary starts at 11 (just past the old frontier of 10),
+    // not at 0 — blocks 0..10 were in the genesis window, not "never seen".
+    const summary = warns.find((w) => w.includes('Skipping blocks'));
+    expect(summary).toContain('Skipping blocks 11..');
   });
 
   it('keeps alerting on recent blocks a warp-synced node has, despite an unavailable old block', async () => {
