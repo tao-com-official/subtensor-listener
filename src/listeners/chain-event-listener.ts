@@ -416,8 +416,9 @@ export class ChainEventListener {
   /**
    * Scans `work` in batches of {@link SCAN_CONCURRENCY}, returning whether any
    * block was handled — i.e. whether this pass made progress at all. `gen` is
-   * the apiGen the caller derived the work under; a batch scanned after the
-   * connection was replaced says nothing about the current one and is dropped.
+   * the apiGen the caller derived the work under; once the connection is
+   * replaced we stop issuing *new* batches (the fresh connection's own drain
+   * takes over), but results already in hand are still recorded — see below.
    */
   private async scanBatches(work: number[], gen: number): Promise<boolean> {
     let handled = false;
@@ -425,12 +426,18 @@ export class ChainEventListener {
       if (this.stopped || this.apiGen !== gen) return handled;
       const batch = work.slice(i, i + SCAN_CONCURRENCY);
       const results = await Promise.all(batch.map((n) => this.handleBlock(n)));
-      if (this.apiGen !== gen) return handled;
 
-      // Only a fully-handled block is recorded. A block that failed or isn't on
-      // this node yet simply stays out of `done`, so it returns as work next
-      // pass; if it ages out of the window unhandled, advanceFloor derives the
-      // miss from its absence in `done` — no side record needed.
+      // Record every fully-handled block, even if the connection was replaced
+      // while this batch was in flight. A BLOCK_OK is trustworthy on its own:
+      // handleBlock re-checks the generation between scan and delivery, so a
+      // scan on a since-replaced connection returns BLOCK_FAILED, never OK.
+      // Discarding OK results on a generation change instead dropped a block
+      // whose alert had *already* been delivered (recreate during the send
+      // await), which advanceFloor then mis-reported as a missed alert.
+      //
+      // A block that failed or isn't on this node yet simply stays out of
+      // `done`, returns as work next pass, and if it ages out unhandled
+      // advanceFloor derives the miss from its absence — no side record needed.
       batch.forEach((n, idx) => {
         if (results[idx] === BLOCK_OK) {
           this.done.add(n);

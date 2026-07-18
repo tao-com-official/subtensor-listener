@@ -212,6 +212,9 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
   let attempted: string[];
   /** When true the webhook rejects every POST (returns false, as it really does). */
   let webhookDown: boolean;
+  /** If set, a delivery awaits this before resolving — lets a test interleave. */
+  let sendGate: Promise<void> | undefined;
+  let onSend: ((msg: string) => void) | undefined;
   let errors: string[];
   let warns: string[];
   let listener: ChainEventListener;
@@ -237,13 +240,17 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     errors = [];
     warns = [];
     webhookDown = false;
+    sendGate = undefined;
+    onSend = undefined;
     const notifier = {
-      send: (_t: unknown, msg: string) => {
+      send: async (_t: unknown, msg: string) => {
         attempted.push(msg);
+        onSend?.(msg);
+        if (sendGate) await sendGate;
         // WebhookNotifier never throws — it returns false on failure.
-        if (webhookDown) return Promise.resolve(false);
+        if (webhookDown) return false;
         sent.push(msg);
-        return Promise.resolve(true);
+        return true;
       },
     } as unknown as WebhookNotifier;
 
@@ -341,29 +348,6 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     expect(scanner.scanned.filter((n) => n === STUCK).length).toBeGreaterThan(
       1,
     );
-  });
-
-  it('re-reads the upgrade block when the recreate fires mid-scan', async () => {
-    // The production timing: the upgrade IS the block being scanned when
-    // ChainConnectionService recreates the connection under us.
-    scanner.head = UPGRADE_BLOCK;
-    scanner.available = UPGRADE_BLOCK;
-    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
-    scanner.onScan = (n) => {
-      if (n !== UPGRADE_BLOCK) return;
-      scanner.onScan = undefined; // once
-      conn.recreateApi();
-      conn.fireReconnect();
-    };
-
-    await listener.start();
-    await flush();
-
-    // The scan that ran on the doomed connection must not count as handled.
-    expect(
-      scanner.scanned.filter((n) => n === UPGRADE_BLOCK).length,
-    ).toBeGreaterThan(1);
-    expect(sent).toHaveLength(1);
   });
 
   it('scans past an all-unavailable oldest batch to reach newer blocks in a stalled window', async () => {
@@ -699,5 +683,38 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('424 → 432'); // the clean decode
     expect(sent[0]).not.toContain('unknown'); // never the downgraded one
+  });
+
+  it('does not falsely report a miss when a recreate fires during the delivery await', async () => {
+    // The upgrade block is scanned and its alert delivery is IN FLIGHT (webhook
+    // POST awaiting) when the recreate commits and the fresh socket lands far
+    // ahead. The alert goes out, so the block must be recorded as handled — not
+    // discarded by the generation guard and then mis-reported as "NOT alerted".
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+
+    let release!: () => void;
+    sendGate = new Promise<void>((r) => (release = r));
+    onSend = (msg) => {
+      if (!msg.includes(`#${UPGRADE_BLOCK}`)) return;
+      onSend = undefined; // once
+      // Recreate onto a node far ahead WHILE this delivery is awaiting.
+      scanner.head = UPGRADE_BLOCK + BACKFILL + 10;
+      scanner.available = scanner.head;
+      conn.recreateApi();
+      conn.fireReconnect();
+    };
+
+    const startP = listener.start();
+    await flush(); // delivery is now gated open, recreate has fired
+    release(); // the (successful) POST resolves
+    await startP;
+    await flush();
+
+    expect(sent.some((m) => m.includes(`#${UPGRADE_BLOCK}`))).toBe(true); // delivered
+    expect(
+      errors.some((e) => e.includes(`Gave up on block ${UPGRADE_BLOCK}`)),
+    ).toBe(false); // and NOT falsely reported as missed
   });
 });
