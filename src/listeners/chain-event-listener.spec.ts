@@ -272,6 +272,30 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
 
   afterEach(() => listener.stop());
 
+  it('reports liveness that advances as heads arrive', async () => {
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    await listener.start();
+    await flush();
+
+    const afterStart = listener.liveness();
+    expect(afterStart.network).toBe(def.network);
+    expect(afterStart.startedAtMs).not.toBeNull();
+    expect(afterStart.lastHeadAtMs).not.toBeNull(); // start() observed a head
+    expect(afterStart.head).toBe(UPGRADE_BLOCK);
+    expect(afterStart.stopped).toBe(false);
+
+    const before = afterStart.lastHeadAtMs;
+    await new Promise((r) => setTimeout(r, 2));
+    await headTo(UPGRADE_BLOCK + 1);
+    const afterHead = listener.liveness();
+    expect(afterHead.head).toBe(UPGRADE_BLOCK + 1);
+    expect(afterHead.lastHeadAtMs).toBeGreaterThan(before as number);
+
+    listener.stop();
+    expect(listener.liveness().stopped).toBe(true);
+  });
+
   it('retries a block that failed transiently instead of skipping it forever', async () => {
     scanner.head = UPGRADE_BLOCK;
     scanner.available = UPGRADE_BLOCK;

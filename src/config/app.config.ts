@@ -36,6 +36,18 @@ export class AppConfig {
     );
   }
 
+  /**
+   * How long a listener may go without observing a new chain head before
+   * `/health/ready` reports it stalled. On a live chain heads arrive every
+   * `blockTimeSeconds`, so the default (a generous multiple, floored at 60s)
+   * tolerates a few missed blocks without flapping. Also the startup grace: a
+   * fresh listener has this long to see its first head.
+   */
+  get listenerStallSeconds(): number {
+    const fallback = Math.max(60, this.blockTimeSeconds * 8);
+    return this.numberFromEnv('LISTENER_STALL_SECONDS', fallback);
+  }
+
   private numberFromEnv(key: string, fallback: number): number {
     const raw = this.config.get<string>(key);
     if (raw === undefined || raw === null || `${raw}`.trim() === '') {

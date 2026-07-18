@@ -9,7 +9,11 @@ import { ListenersConfig } from '../config/listeners.config';
 import { WebhookNotifier } from '../notifications/webhook.notifier';
 import { BlockScanner } from '../subtensor/block-scanner.service';
 import { ChainConnectionService } from '../subtensor/chain-connection.service';
-import { ChainEventListener, type ReplayResult } from './chain-event-listener';
+import {
+  ChainEventListener,
+  type ListenerLiveness,
+  type ReplayResult,
+} from './chain-event-listener';
 
 /**
  * Builds one {@link ChainEventListener} per configured definition, starts them
@@ -66,6 +70,16 @@ export class ListenersManager
   /** Lists configured listener names (for the test endpoint / diagnostics). */
   networks(): string[] {
     return this.config.listeners.map((l) => l.network);
+  }
+
+  /** How many listeners are configured (may exceed the number started yet). */
+  expectedCount(): number {
+    return this.config.listeners.length;
+  }
+
+  /** Progress snapshot per running listener, for the health check. */
+  liveness(): ListenerLiveness[] {
+    return Array.from(this.listeners.values()).map((l) => l.liveness());
   }
 
   /**
