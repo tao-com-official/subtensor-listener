@@ -30,7 +30,7 @@ export class ListenersManager
     private readonly notifier: WebhookNotifier,
   ) {}
 
-  async onApplicationBootstrap(): Promise<void> {
+  onApplicationBootstrap(): void {
     const defs = this.config.listeners;
     if (defs.length === 0) {
       this.logger.warn('No listeners configured — nothing to watch.');
@@ -46,16 +46,25 @@ export class ListenersManager
       );
       this.listeners.set(def.network, listener);
     }
-    // Start concurrently; a failure in one shouldn't block the others.
-    await Promise.all(
-      Array.from(this.listeners.entries()).map(([network, listener]) =>
-        listener.start().catch((err) => {
-          this.logger.error(
-            `Listener "${network}" failed to start: ${(err as Error).message}`,
-          );
-        }),
-      ),
-    );
+    // Start each listener in the BACKGROUND — deliberately not awaited.
+    //
+    // start() blocks on the initial RPC connection (ApiPromise.create /
+    // isReady), which for an unreachable endpoint never resolves *and never
+    // rejects* — so it hangs rather than throwing, and the .catch below can't
+    // save us. Awaiting it here would stall Nest's bootstrap, so app.listen()
+    // never binds the HTTP port: /health/live becomes unreachable, the k8s
+    // liveness probe fails, and the pod restart-loops — taking the healthy
+    // listeners down with it every couple of minutes. One dead network must not
+    // do that. Firing without awaiting lets the process come up and serve
+    // /health immediately; each listener connects (and starts alerting) if and
+    // when its endpoint does, retrying underneath via the WsProvider.
+    for (const [network, listener] of this.listeners) {
+      void listener.start().catch((err) => {
+        this.logger.error(
+          `Listener "${network}" failed to start: ${(err as Error).message}`,
+        );
+      });
+    }
   }
 
   onApplicationShutdown(): void {
