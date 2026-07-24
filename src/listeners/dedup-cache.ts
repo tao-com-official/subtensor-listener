@@ -37,7 +37,8 @@ export class DedupCache {
    * alerts once per window rather than never.
    *
    * A reservation made here can be released with {@link forget} if the delivery
-   * it was for then fails, so a transient webhook outage doesn't cost the alert.
+   * it was for then *provably* posted nothing, so a transient webhook outage
+   * doesn't cost the alert.
    */
   shouldAlert(key: string, blockNumber: number): boolean {
     const last = this.lastAlerted.get(key);
@@ -59,9 +60,14 @@ export class DedupCache {
   }
 
   /**
-   * Undoes a {@link shouldAlert} reservation for a delivery that then failed,
-   * so the block can be retried. Only clears the marker if it still points at
-   * this block — a later reservation for the same key must not be dropped.
+   * Undoes a {@link shouldAlert} reservation for a delivery that provably
+   * posted nothing, so the block can be retried. Only clears the marker if it
+   * still points at this block — a later reservation for the same key must not
+   * be dropped.
+   *
+   * Callers must NOT call this for a delivery whose outcome is merely unknown
+   * (a 5xx, a read timeout): the retry it enables is then a second alert for a
+   * message that already landed.
    *
    * The cache keeps a single marker per key, so this cannot restore an *earlier*
    * suppressed position: if a delivery beyond the window moved the marker and

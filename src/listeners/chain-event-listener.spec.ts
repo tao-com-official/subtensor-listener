@@ -5,7 +5,10 @@ import {
   type MatchedEvent,
 } from '../subtensor/block-scanner.service';
 import type { ChainConnectionService } from '../subtensor/chain-connection.service';
-import type { WebhookNotifier } from '../notifications/webhook.notifier';
+import type {
+  DeliveryStatus,
+  WebhookNotifier,
+} from '../notifications/webhook.notifier';
 import {
   ChainEventListener,
   dedupKey,
@@ -210,8 +213,10 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
   let sent: string[];
   /** Attempted deliveries, including ones the webhook rejected. */
   let attempted: string[];
-  /** When true the webhook rejects every POST (returns false, as it really does). */
+  /** When true the webhook refuses every POST — a definitive non-delivery. */
   let webhookDown: boolean;
+  /** Overrides the delivery outcome (e.g. an ambiguous 5xx / read timeout). */
+  let webhookOutcome: DeliveryStatus | undefined;
   /** If set, a delivery awaits this before resolving — lets a test interleave. */
   let sendGate: Promise<void> | undefined;
   let onSend: ((msg: string) => void) | undefined;
@@ -240,6 +245,7 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
     errors = [];
     warns = [];
     webhookDown = false;
+    webhookOutcome = undefined;
     sendGate = undefined;
     onSend = undefined;
     const notifier = {
@@ -247,10 +253,11 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
         attempted.push(msg);
         onSend?.(msg);
         if (sendGate) await sendGate;
-        // WebhookNotifier never throws — it returns false on failure.
-        if (webhookDown) return false;
-        sent.push(msg);
-        return true;
+        // WebhookNotifier never throws — it classifies every outcome.
+        const status: DeliveryStatus =
+          webhookOutcome ?? (webhookDown ? 'rejected' : 'delivered');
+        if (status === 'delivered') sent.push(msg);
+        return { status };
       },
     } as unknown as WebhookNotifier;
 
@@ -468,6 +475,55 @@ describe('ChainEventListener — lagging node / failed block handling', () => {
 
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('CodeUpdated');
+  });
+
+  /**
+   * Regression for the duplicate upgrade alerts seen on 22–23 Jul 2026: every
+   * `system.CodeUpdated` arrived in Slack twice, 0.3–1.2s apart, from a single
+   * pod — the same block was delivered, reported as failed, un-reserved and
+   * delivered again within the same drain pass. A failure the webhook may still
+   * have acted on must not release the dedup reservation.
+   */
+  it('does not re-alert when the delivery outcome is ambiguous (5xx / timeout)', async () => {
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+    webhookOutcome = 'unknown';
+
+    await listener.start();
+    await flush();
+    expect(attempted).toHaveLength(1); // anti-vacuity: it did try once
+
+    // Later heads must not re-deliver: the first POST may already be in the
+    // channel, and retrying it is exactly what produced the duplicates.
+    await headTo(UPGRADE_BLOCK + 1);
+    await headTo(UPGRADE_BLOCK + 2);
+
+    expect(attempted).toHaveLength(1);
+    // ...but a possibly-lost alert is never silent.
+    expect(
+      errors.some((e) => e.includes('may or may not have reached the webhook')),
+    ).toBe(true);
+  });
+
+  it('still retries a definitively refused delivery, without waiting for the next head', async () => {
+    scanner.head = UPGRADE_BLOCK;
+    scanner.available = UPGRADE_BLOCK;
+    scanner.matches.set(UPGRADE_BLOCK, [codeUpdated(UPGRADE_BLOCK)]);
+    // Every block in the window carries work, so the drain loop keeps going
+    // after the failed block — the tight retry path that ran within ~1s in
+    // production, here on a refusal, where a retry is safe.
+    webhookDown = true;
+    onSend = () => {
+      // The webhook comes back up right after the first attempt is refused.
+      if (attempted.length >= 2) webhookDown = false;
+    };
+
+    await listener.start();
+    await flush();
+
+    expect(attempted).toHaveLength(2); // refused, then retried
+    expect(sent).toHaveLength(1); // and delivered exactly once
   });
 
   it('logs loudly when a block leaves the window unread', async () => {

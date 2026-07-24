@@ -17,7 +17,10 @@ so new watches need no code changes.
 - On a match, enriches with `specVersion` (old→new), block hash and timestamp,
   renders a message from a template, and POSTs it to the listener's webhook.
 - In-memory dedup avoids re-alerting within a process lifetime (the service is
-  stateless — no DB).
+  stateless — no DB). A failed delivery is only retried when the webhook
+  provably took nothing (refused connection, 4xx/429); an ambiguous failure
+  (5xx, read timeout) is logged loudly and left alone, since retrying it would
+  post the alert twice.
 
 ## Configuration
 
@@ -71,6 +74,11 @@ curl -X POST http://localhost:3020/test/replay \
 ```
 
 Set `TEST_API_SECRET` to enable it (unset = disabled, returns 403).
+
+Each replayed event reports `sent` plus a `delivery` outcome
+(`delivered` / `rejected` / `unknown`). Use it before replaying a block twice:
+`rejected` means the webhook took nothing, `unknown` means the message may
+already be in the channel.
 
 ## Scripts
 

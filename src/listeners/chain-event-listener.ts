@@ -6,7 +6,10 @@ import {
   renderMessage,
   type TemplateVars,
 } from '../notifications/message-template';
-import type { WebhookNotifier } from '../notifications/webhook.notifier';
+import type {
+  DeliveryStatus,
+  WebhookNotifier,
+} from '../notifications/webhook.notifier';
 import {
   BlockScanner,
   BlockUnavailableError,
@@ -23,8 +26,18 @@ export interface ReplayedEvent {
   specVersionChange: string;
   timestamp: string;
   message: string;
-  /** Whether the notification was actually delivered (false on dry-run). */
+  /**
+   * Whether the notification was actually delivered (false on dry-run).
+   * Derivable from {@link delivery}, kept as its own field because it is part
+   * of the published `/test/replay` response shape.
+   */
   sent: boolean;
+  /**
+   * How the delivery attempt ended; absent when none was made (dry-run). Tells
+   * a replay operator whether a `sent: false` means "safe to replay again"
+   * (`rejected`) or "it may already be in the channel" (`unknown`).
+   */
+  delivery?: DeliveryStatus;
 }
 
 export interface ReplayResult {
@@ -536,7 +549,7 @@ export class ChainEventListener {
   /**
    * Scans one block and delivers any matches. Only reports {@link BLOCK_OK} —
    * i.e. "handled", never to be looked at again — once every alert in it has
-   * actually been delivered.
+   * been delivered, or has failed in a way a retry could only duplicate.
    */
   private async handleBlock(blockNumber: number): Promise<BlockOutcome> {
     const gen = this.apiGen;
@@ -568,12 +581,29 @@ export class ChainEventListener {
         this.logger.log(
           `Matched ${match.pallet}.${match.event} in block ${blockNumber}.`,
         );
-        const { sent } = await this.handleMatch(match, { send: true });
-        // A webhook that is briefly down must not cost us the alert: release the
-        // reservation and leave the block unhandled so the next head retries it.
+        const { sent, delivery } = await this.handleMatch(match, {
+          send: true,
+        });
         if (!sent) {
-          this.dedup.forget(key, blockNumber);
-          return BLOCK_FAILED;
+          // A webhook that provably took nothing (refused connection, 4xx, 429)
+          // must not cost us the alert: release the reservation and leave the
+          // block unhandled so the next head retries it. A retry cannot
+          // duplicate a message that was never posted.
+          if (delivery === 'rejected') {
+            this.dedup.forget(key, blockNumber);
+            return BLOCK_FAILED;
+          }
+          // Ambiguous failure (5xx, read timeout, socket reset): the message may
+          // already be in the channel. Releasing the reservation here is what
+          // double-alerted on every runtime upgrade — the retry landed within a
+          // second and Slack showed both. So keep the reservation and count the
+          // block as handled, but say so loudly: this is also the one path where
+          // an alert can be silently lost, and /test/replay can recover it.
+          this.logger.error(
+            `Delivery of ${match.pallet}.${match.event} in block ${blockNumber} ` +
+              `may or may not have reached the webhook; not retrying, because a ` +
+              `retry would double-alert. If the alert is missing, replay the block.`,
+          );
         }
       }
       return BLOCK_OK;
@@ -598,12 +628,13 @@ export class ChainEventListener {
     const template = this.def.messageTemplate ?? DEFAULT_TEMPLATE;
     const message = renderMessage(template, vars);
 
-    let sent = false;
+    let delivery: DeliveryStatus | undefined;
     if (opts.send) {
-      sent = await this.notifier.send(
+      const result = await this.notifier.send(
         { url: this.def.webhookUrl, field: this.def.webhookField },
         message,
       );
+      delivery = result.status;
     }
 
     return {
@@ -613,7 +644,8 @@ export class ChainEventListener {
       specVersionChange: vars.specVersionChange,
       timestamp: vars.timestamp,
       message,
-      sent,
+      sent: delivery === 'delivered',
+      delivery,
     };
   }
 
