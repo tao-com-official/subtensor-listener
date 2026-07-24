@@ -40,7 +40,9 @@ array.
   window, then follow **new (best)** heads; in-memory dedup; reconnect gap-fill)
   and `ListenersManager` (lifecycle + test replay routing).
 - `src/notifications` — generic `{{token}}` template rendering + `WebhookNotifier`
-  (best-effort POST, one retry on 429).
+  (best-effort POST, one retry on 429). Every attempt is classified
+  `delivered` / `rejected` / `unknown`; only `rejected` (provably posted
+  nothing) may be retried by the caller.
 - `src/health` — `/health/live` (liveness) and `/health/ready` (RED if any RPC
   connection is down; per-connection detail in the body). Maps to k8s probes.
 - `src/test-endpoint` — secret-guarded `POST /test/replay` to run a specific
@@ -78,3 +80,6 @@ curl -X POST http://localhost:3020/test/replay \
 ```
 `block` accepts a number or a `0x` hash. `dryRun: true` renders without
 delivering; omit it (or set false) to send for real, exactly like live mode.
+Each event in the response carries `sent` and a `delivery` outcome
+(`delivered` / `rejected` / `unknown`) — `unknown` means a repeat replay may
+duplicate a message that already landed.
