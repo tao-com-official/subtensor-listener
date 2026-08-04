@@ -16,7 +16,7 @@ async function bootstrap() {
   const config = app.get(AppConfig);
   await app.listen(config.port);
   new Logger('Bootstrap').log(
-    `subtensor-listener listening on :${config.port}`,
+    `subtensor-listener listening on port:${config.port}`,
   );
 }
 
