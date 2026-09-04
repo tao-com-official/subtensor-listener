@@ -10,7 +10,10 @@ so new watches need no code changes.
 ## How it works
 
 - Connects to one or more RPC endpoints per listener (`@polkadot/api`), shared
-  per endpoint set, with auto-reconnect across the failover list.
+  per endpoint set, with auto-reconnect across the failover list. A watchdog
+  rebuilds the connection of any listener that stops seeing heads for
+  `LISTENER_STALL_SECONDS`, and keeps retrying — the provider's own reconnect
+  can wedge on a handshake that never completes and then never retries again.
 - Backfills a recent window (default 10 min) on startup, then follows
   **new (best)** heads, so an alert fires as soon as the event lands in a
   block — without waiting for finalization.

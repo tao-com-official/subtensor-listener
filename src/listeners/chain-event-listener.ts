@@ -60,6 +60,17 @@ export interface ListenerLiveness {
   stopped: boolean;
 }
 
+/**
+ * How long this listener has gone without observing a head. Measured from the
+ * last head or, before the first one arrives, from when the listener started —
+ * so a slow initial connect gets the same grace window rather than reading as
+ * an instant stall. The readiness check and the reconnect watchdog share this
+ * measurement so they can never disagree about how idle a listener is.
+ */
+export function idleMsOf(s: ListenerLiveness, nowMs: number): number {
+  return Math.max(0, nowMs - (s.lastHeadAtMs ?? s.startedAtMs ?? nowMs));
+}
+
 /** How many blocks to scan concurrently while backfilling a range. */
 const SCAN_CONCURRENCY = 5;
 

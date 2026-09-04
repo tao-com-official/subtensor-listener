@@ -73,6 +73,21 @@ export class ChainConnectionService implements OnApplicationShutdown {
     return () => entry.reconnectHandlers.delete(handler);
   }
 
+  /**
+   * Discards the connection for an endpoint set and builds a fresh one. The
+   * WsProvider's own auto-reconnect can wedge for good: it schedules exactly one
+   * retry per close event, and a retry whose handshake never completes emits no
+   * open, error or close — so nothing ever schedules another. Recreating from
+   * scratch is the only way back, and it is safe to call repeatedly.
+   */
+  reconnect(endpoints: string[]): void {
+    if (this.shuttingDown) return;
+    const entry = this.pool.get(keyOf(endpoints));
+    if (!entry) return;
+    this.logger.warn(`Forcing a fresh connection to ${entry.endpoints[0]}.`);
+    this.recreate(entry);
+  }
+
   /** Per-connection status for the health check. */
   statuses(): ConnectionStatus[] {
     return Array.from(this.pool.values()).map((e) => ({
@@ -251,24 +266,23 @@ export class ChainConnectionService implements OnApplicationShutdown {
 }
 
 /**
- * Best-effort teardown of a connection: disconnect the api, falling back to the
- * provider directly if the api never resolved (e.g. a rejected create) — which
- * otherwise leaves the WsProvider's auto-reconnect timer running.
+ * Best-effort teardown of a connection. The provider goes first because it is
+ * the one that must be stopped: awaiting the api would hang forever whenever
+ * `ApiPromise.create` never settled — the exact state a wedged reconnect leaves
+ * behind — and every repeated attempt would then leak its socket and retry
+ * timer. Disconnecting the provider closes the socket and clears its
+ * auto-reconnect; the api's own cleanup is fired and forgotten on top.
  */
 async function disposeConnection(
   apiPromise: Promise<ApiPromise>,
   provider: WsProvider,
 ): Promise<void> {
   try {
-    const api = await apiPromise;
-    await api.disconnect();
+    await provider.disconnect();
   } catch {
-    try {
-      await provider.disconnect();
-    } catch {
-      /* best-effort */
-    }
+    /* best-effort */
   }
+  void apiPromise.then((api) => api.disconnect()).catch(() => undefined);
 }
 
 /** Canonical pool key for a set of endpoints (order-sensitive: primary first). */

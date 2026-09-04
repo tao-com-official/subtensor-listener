@@ -7,6 +7,7 @@
  * against this by recreating the connection when the runtime version changes.
  * These tests drive a mocked `@polkadot/api` to assert that behaviour.
  */
+import { ApiPromise } from '@polkadot/api';
 import { ChainConnectionService } from './chain-connection.service';
 
 type Handlers = Record<string, () => void>;
@@ -131,6 +132,58 @@ describe('ChainConnectionService — runtime-upgrade recreation', () => {
 
     expect(apis[0].unsub).toHaveBeenCalled(); // version subscription torn down
     expect(apis[0].disconnect).toHaveBeenCalled(); // socket closed
+  });
+
+  it('rebuilds the connection on demand and re-fires reconnect handlers', async () => {
+    const onReconnect = jest.fn();
+    service.onReconnect(endpoints, onReconnect);
+    await service.getConnection(endpoints);
+    await flush();
+    providers[0].emit('connected'); // initial connect
+
+    service.reconnect(endpoints);
+    await flush();
+
+    expect(apis).toHaveLength(2);
+    expect(providers[0].disconnect).toHaveBeenCalled(); // stale socket closed
+    providers[1].emit('connected');
+    expect(onReconnect).toHaveBeenCalledTimes(1); // listeners re-attach
+    await expect(service.getConnection(endpoints)).resolves.toBe(apis[1]);
+  });
+
+  it('rebuilds a connection whose endpoint was never reachable', async () => {
+    // A listener whose endpoint is down at boot hangs in start() before
+    // getConnection ever resolves — it only ever registered its reconnect
+    // handler. The pooled entry must already exist by then, or the watchdog
+    // finds nothing and that endpoint stays dead for the life of the process.
+    service.onReconnect(endpoints, jest.fn());
+    expect(providers).toHaveLength(1); // registering a handler opens the entry
+
+    service.reconnect(endpoints);
+    await flush();
+
+    expect(providers).toHaveLength(2);
+    expect(providers[0].disconnect).toHaveBeenCalled();
+  });
+
+  it('keeps rebuilding when a replacement connection never comes up', async () => {
+    // The wedged case the watchdog exists for: a fresh ApiPromise.create that
+    // never settles. Teardown must not await it, or every superseded socket
+    // (and its retry timer) would leak on the next attempt.
+    await service.getConnection(endpoints);
+    await flush();
+    providers[0].emit('connected');
+
+    (ApiPromise.create as jest.Mock).mockImplementationOnce(
+      () => new Promise<never>(() => undefined),
+    );
+    service.reconnect(endpoints); // this one never comes up
+    await flush();
+    service.reconnect(endpoints); // must not hang on the previous api
+    await flush();
+
+    expect(providers).toHaveLength(3);
+    expect(providers[1].disconnect).toHaveBeenCalled();
   });
 
   it('refuses to hand out connections once shutting down', async () => {

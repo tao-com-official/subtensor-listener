@@ -4,6 +4,7 @@ import {
   HealthIndicatorService,
 } from '@nestjs/terminus';
 import { AppConfig } from '../config/app.config';
+import { idleMsOf } from '../listeners/chain-event-listener';
 import { ListenersManager } from '../listeners/listeners.manager';
 
 /**
@@ -14,9 +15,7 @@ import { ListenersManager } from '../listeners/listeners.manager';
  * listener has gone longer than `listenerStallSeconds` without observing a new
  * head, with a per-listener breakdown for diagnostics.
  *
- * "Idle" is measured from the last head OR, before the first head arrives, from
- * when the listener started — so a slow initial connect gets the same grace
- * window rather than flapping red on boot. A stopped listener is never stalled.
+ * "Idle" is measured by {@link idleMsOf}. A stopped listener is never stalled.
  */
 @Injectable()
 export class ListenerHealthIndicator {
@@ -34,8 +33,7 @@ export class ListenerHealthIndicator {
     const now = Date.now();
 
     const listeners = this.manager.liveness().map((s) => {
-      const since = s.lastHeadAtMs ?? s.startedAtMs ?? now;
-      const idleMs = Math.max(0, now - since);
+      const idleMs = idleMsOf(s, now);
       const stalled = !s.stopped && idleMs > thresholdMs;
       return {
         network: s.network,
