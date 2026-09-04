@@ -38,7 +38,8 @@ array.
   (matches events in a block, enriches with `specVersion` old→new + timestamp).
 - `src/listeners` — `ChainEventListener` (per definition: backfill the recent
   window, then follow **new (best)** heads; in-memory dedup; reconnect gap-fill)
-  and `ListenersManager` (lifecycle + test replay routing).
+  and `ListenersManager` (lifecycle, test replay routing, and the watchdog that
+  rebuilds a stalled listener's connection).
 - `src/notifications` — generic `{{token}}` template rendering + `WebhookNotifier`
   (best-effort POST, one retry on 429). Every attempt is classified
   `delivered` / `rejected` / `unknown`; only `rejected` (provably posted

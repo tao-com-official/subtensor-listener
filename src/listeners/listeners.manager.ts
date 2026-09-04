@@ -11,6 +11,7 @@ import { BlockScanner } from '../subtensor/block-scanner.service';
 import { ChainConnectionService } from '../subtensor/chain-connection.service';
 import {
   ChainEventListener,
+  idleMsOf,
   type ListenerLiveness,
   type ReplayResult,
 } from './chain-event-listener';
@@ -25,6 +26,7 @@ export class ListenersManager
 {
   private readonly logger = new Logger(ListenersManager.name);
   private readonly listeners = new Map<string, ChainEventListener>();
+  private watchdog?: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly config: ListenersConfig,
@@ -69,11 +71,45 @@ export class ListenersManager
         );
       });
     }
+
+    // The poll period is the stall threshold itself: a listener always gets a
+    // full threshold to produce a head before its connection is touched, and a
+    // stall is noticed within two.
+    const stallMs = this.appConfig.listenerStallSeconds * 1000;
+    this.watchdog = setInterval(() => this.reconnectStalled(stallMs), stallMs);
   }
 
   onApplicationShutdown(): void {
+    if (this.watchdog) clearInterval(this.watchdog);
+    this.watchdog = undefined;
     for (const listener of this.listeners.values()) listener.stop();
     this.listeners.clear();
+  }
+
+  /**
+   * Rebuilds the connection behind every listener that has stopped seeing
+   * heads. The WsProvider cannot always do this itself — a reconnect whose
+   * handshake never completes leaves the socket silent forever, and the
+   * listener then sits dead behind a process that is otherwise healthy (only a
+   * pod restart or a runtime-upgrade recreate ever brought it back). Runs on a
+   * timer rather than once, so an endpoint that is still down simply gets
+   * another attempt on the next pass.
+   */
+  private reconnectStalled(stallMs: number): void {
+    const now = Date.now();
+    for (const def of this.config.listeners) {
+      const listener = this.listeners.get(def.network);
+      if (!listener) continue;
+      const state = listener.liveness();
+      if (state.stopped) continue;
+      const idleMs = idleMsOf(state, now);
+      if (idleMs < stallMs) continue;
+      this.logger.warn(
+        `Listener "${def.network}" has seen no head for ` +
+          `${Math.round(idleMs / 1000)}s — reconnecting.`,
+      );
+      this.connection.reconnect(def.endpoints);
+    }
   }
 
   /** Lists configured listener names (for the test endpoint / diagnostics). */
