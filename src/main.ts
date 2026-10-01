@@ -1,10 +1,14 @@
-import { Logger, ValidationPipe } from '@nestjs/common';
+import { ConsoleLogger, Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { AppConfig } from './config/app.config';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // One JSON object per line (no ANSI colours) so New Relic parses level,
+  // context and message into attributes.
+  const app = await NestFactory.create(AppModule, {
+    logger: new ConsoleLogger({ json: true }),
+  });
 
   // Strip unknown properties and coerce DTOs across all routes.
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
