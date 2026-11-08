@@ -72,16 +72,9 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build_image
     if: github.ref_name == 'main' && github.actor != 'dependabot[bot]'
-    env:
-      VERSIONS_PAT: ${{ secrets.VERSIONS_PAT }}
+    outputs:
+      promote_tag: ${{ steps.promote.outputs.promote_tag }}
     steps:
-      - name: Check required secrets
-        run: |
-          if [ -z "$VERSIONS_PAT" ]; then
-            echo "::error::Missing VERSIONS_PAT secret. Add it to subtensor-listener so CI can update tao-com-official/versions."
-            exit 1
-          fi
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -98,21 +91,14 @@ jobs:
           echo "promote_tag=prod-${{ needs.build_image.outputs.image_tag }}" >> "$GITHUB_OUTPUT"
           echo "Pushed prod-${{ needs.build_image.outputs.image_tag }}"
 
-      - name: Install yq
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
-          yq --version
-
-      - name: Update image tag in versions repo
-        env:
-          PROD_IMAGE_TAG: ${{ steps.promote.outputs.promote_tag }}
-        run: |
-          git clone "https://x-access-token:${VERSIONS_PAT}@github.com/tao-com-official/versions.git" versions-repo
-          cd versions-repo
-          git config user.email "ci@tao.com"
-          git config user.name "GitHub Actions"
-          yq e '.image.tag = strenv(PROD_IMAGE_TAG)' -i prod/subtensor-listener/values.yaml
-          git add prod/subtensor-listener/values.yaml
-          git commit -m "chore: update prod-subtensor-listener image to ${PROD_IMAGE_TAG}"
-          git push
+  # The production environment (main only) gates this job and holds the prod
+  # writer App key; versions bump.yaml opens the prod-bump/ PR.
+  bump:
+    needs: promote_prod
+    permissions: {}
+    uses: tao-com-official/versions/.github/workflows/bump.yaml@main
+    with:
+      environment: production
+      files: prod/subtensor-listener/values.yaml
+      tag: ${{ needs.promote_prod.outputs.promote_tag }}
+    secrets: inherit
