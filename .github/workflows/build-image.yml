@@ -91,14 +91,47 @@ jobs:
           echo "promote_tag=prod-${{ needs.build_image.outputs.image_tag }}" >> "$GITHUB_OUTPUT"
           echo "Pushed prod-${{ needs.build_image.outputs.image_tag }}"
 
-  # The production environment (main only) gates this job and holds the prod
-  # writer App key; versions bump.yaml opens the prod-bump/ PR.
+  # The production environment (reviewers, main only) gates this job and holds
+  # the prod writer App key. This repo is public, so it cannot call the private
+  # versions bump.yaml; it runs the same scripts/bump-pr.sh from the versions
+  # checkout instead, which opens a prod-bump/ PR as the prod writer App.
   bump:
     needs: promote_prod
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    environment: production
     permissions: {}
-    uses: tao-com-official/versions/.github/workflows/bump.yaml@main
-    with:
-      environment: production
-      files: prod/subtensor-listener/values.yaml
-      tag: ${{ needs.promote_prod.outputs.promote_tag }}
-    secrets: inherit
+    steps:
+      - name: Mint versions token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.VERSIONS_PROD_APP_CLIENT_ID }}
+          private-key: ${{ secrets.VERSIONS_PROD_APP_PRIVATE_KEY }}
+          owner: tao-com-official
+          repositories: versions
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Pin promoted image in versions
+        env:
+          TAG: ${{ needs.promote_prod.outputs.promote_tag }}
+          VERSIONS_TOKEN: ${{ steps.app.outputs.token }}
+          BUMP_BRANCH_PREFIX: prod-bump
+        run: |
+          set -euo pipefail
+          git clone -q "https://x-access-token:${VERSIONS_TOKEN}@github.com/tao-com-official/versions.git" versions-repo
+          cd versions-repo
+          git config user.email "ci@tao.com"
+          git config user.name "versions bump"
+          yq e '.image.tag = strenv(TAG)' -i prod/subtensor-listener/values.yaml
+          if git diff --quiet; then
+            echo "prod/subtensor-listener is already pinned to ${TAG}."
+            exit 0
+          fi
+          git commit -qam "chore: bump prod/subtensor-listener/values.yaml to ${TAG} (${GITHUB_REPOSITORY})"
+          scripts/bump-pr.sh
