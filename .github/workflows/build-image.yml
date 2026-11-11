@@ -16,6 +16,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write # AWS OIDC, to push the prod tag to ECR
 
 concurrency:
   group: image-${{ github.ref }}
@@ -82,11 +83,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # DEVOPS-47: the prod tag also goes to ECR, where prod pulls move.
+      - name: Assume the ECR push role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::032761628776:role/ecr-push-subtensor-listener
+          aws-region: us-east-1
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Retag as prod
         id: promote
         run: |
           docker buildx imagetools create \
             --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-${{ needs.build_image.outputs.image_tag }} \
+            --tag 032761628776.dkr.ecr.us-east-1.amazonaws.com/taocom/subtensor-listener:prod-${{ needs.build_image.outputs.image_tag }} \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build_image.outputs.image_tag }}
           echo "promote_tag=prod-${{ needs.build_image.outputs.image_tag }}" >> "$GITHUB_OUTPUT"
           echo "Pushed prod-${{ needs.build_image.outputs.image_tag }}"
@@ -129,6 +141,8 @@ jobs:
           git config user.email "ci@tao.com"
           git config user.name "versions bump"
           yq e '.image.tag = strenv(TAG)' -i prod/subtensor-listener/values.yaml
+          # DEVOPS-47: the tag above is also in ECR, so the pin moves there with it.
+          yq e '.image.repository |= sub("^ghcr\.io/tao-com-official/"; "032761628776.dkr.ecr.us-east-1.amazonaws.com/taocom/")' -i prod/subtensor-listener/values.yaml
           if git diff --quiet; then
             echo "prod/subtensor-listener is already pinned to ${TAG}."
             exit 0
