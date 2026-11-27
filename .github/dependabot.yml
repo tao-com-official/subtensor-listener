@@ -1,0 +1,55 @@
+# Dependency update PRs for the app's npm packages, Docker base images and the workflows' actions.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait a week before proposing a freshly published version, so a compromised release is usually
+    # caught and pulled before it gets here.
+    cooldown:
+      default-days: 7
+    # No automatic rebase when the base branch moves: each rebase re-runs the checks. A PR in
+    # conflict needs `@dependabot rebase`.
+    rebase-strategy: disabled
+    open-pull-requests-limit: 5
+    # Minor and patch updates arrive as one weekly PR. A major stays its own PR. Security updates
+    # arrive as one PR.
+    groups:
+      npm:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # Docker base images. A major stays its own PR.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    rebase-strategy: disabled
+    groups:
+      docker:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Keeps the workflows' `uses:` refs on the latest release.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    rebase-strategy: disabled
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns: ["*"]
+      github-actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
